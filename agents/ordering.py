@@ -36,7 +36,7 @@ from tools.order_calculator import calculate_order_quantity
 
 AGENT_NAME = "ordering_agent"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 1024
+MAX_TOKENS = 4096
 
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "ordering_system.txt"
 
