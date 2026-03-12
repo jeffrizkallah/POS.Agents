@@ -138,8 +138,8 @@ async def draft_purchase_orders(
             pool=pool,
             restaurant_id=restaurant_id,
             agent_name=AGENT_NAME,
-            action_type="claude_error",
-            summary=f"Claude API call failed for {restaurant_name}: {e}",
+            action_type="service_error",
+            summary=f"Could not generate purchase orders for {restaurant_name}. The AI service returned an unexpected response.",
             data={"error": str(e)},
             status="failed",
         )
@@ -321,6 +321,10 @@ def _call_claude_sync(payload: dict) -> list[dict]:
     )
 
     raw_text = response.content[0].text.strip()
+    # Strip markdown code fences if Claude wraps the JSON in ```json ... ```
+    if raw_text.startswith("```"):
+        raw_text = raw_text.split("\n", 1)[-1]
+        raw_text = raw_text.rsplit("```", 1)[0].strip()
 
     try:
         parsed = json.loads(raw_text)

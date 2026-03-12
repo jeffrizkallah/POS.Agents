@@ -51,16 +51,16 @@ async def run_inventory_check(pool, restaurant_id: str) -> list[dict]:
     low_stock = await get_low_stock_ingredients(pool, restaurant_id)
 
     if not low_stock:
-        await log_agent_action(
-            pool=pool,
-            restaurant_id=restaurant_id,
-            agent_name=AGENT_NAME,
-            action_type="inventory_scan",
-            summary="Inventory scan complete — no low-stock items found.",
-            data={"low_stock_count": 0},
-            status="completed",
-        )
         print(f"[Inventory] No low-stock items for restaurant {restaurant_id}")
+        await log_agent_action(
+            pool,
+            restaurant_id,
+            "inventory_agent",
+            "inventory_scan",
+            "Inventory scan complete — no low-stock items found.",
+            {"low_stock_count": 0},
+            "completed",
+        )
         return []
 
     enriched = []
