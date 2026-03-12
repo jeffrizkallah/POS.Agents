@@ -10,9 +10,9 @@
 
 ## Current Status
 
-- **Current Phase:** 3 — Inventory & Ordering Agents
-- **Current Chunk:** 3D complete, 3E next (Railway deployment)
-- **Last Updated:** March 11, 2026
+- **Current Phase:** 4 — Pricing Agent
+- **Current Chunk:** 4D complete — Classification engine added. Next: Phase 5 (Customer Success Agent)
+- **Last Updated:** March 12, 2026
 
 ---
 
@@ -154,7 +154,7 @@
   - Build `tests/test_agents.py`: integration test that runs a full inventory check → draft cycle against demo data
   - Run `pytest` locally and confirm all pass before deploying
 
-- [ ] **3E — Railway Deployment**
+- [x] **3E — Railway Deployment**
   - Push repo to GitHub
   - Connect GitHub repo to Railway
   - Add all environment variables in Railway dashboard (see BIBLE.md § Environment Variables)
@@ -169,7 +169,7 @@
 
 > Build the nightly agent that calculates food costs and generates price recommendations, feeding the Pricing page in the POS dashboard.
 
-- [ ] **4A — Food Cost Snapshot Worker**
+- [x] **4A — Food Cost Snapshot Worker**
   - Build `agents/pricing.py` (part 1: snapshot)
   - Implement `save_food_cost_snapshot(restaurant_id)` async function:
     1. Fetch all active menu items with their recipe_items and ingredient costs
@@ -179,7 +179,7 @@
   - Schedule: run nightly at 02:00 (restaurant is closed, data is stable)
   - This table is what powers the Food Cost Trend chart in the Reports page
 
-- [ ] **4B — Pricing Recommendation Generator**
+- [x] **4B — Pricing Recommendation Generator**
   - Build pricing recommendation logic inside `agents/pricing.py` (part 2)
   - Implement `generate_pricing_recommendations(restaurant_id)`:
     1. Fetch all items where `food_cost_pct > target_food_cost_pct` (from restaurant settings)
@@ -191,11 +191,22 @@
   - Create `prompts/pricing_system.txt` with the Claude system prompt
   - Schedule: run nightly at 02:30 (after snapshots are saved)
 
-- [ ] **4C — Pricing Prompt + Test**
+- [x] **4C — Pricing Prompt + Test**
   - Write and refine `prompts/pricing_system.txt`
   - Test with real Demo Bistro data: confirm recommendations are sensible
   - Verify recommendations appear in POS dashboard Pricing page (`/dashboard/pricing`)
   - Check that accepting a recommendation in the dashboard updates the menu item price in DB
+
+- [x] **4D — Multi-Factor Classification Engine**
+  - Created `tools/pricing_calculator.py`: pure-Python, no DB, fully testable
+    - `calculate_cm(selling_price, ingredient_cost)`
+    - `calculate_avg_cm(items)` — average CM across all menu items
+    - `classify_menu_item(food_cost_pct, target, cm, avg_cm)` → underpriced_star / problem / true_star / plowhorse
+    - `requires_multi_cycle_flag(current_price, ingredient_cost, target_pct, max_increase_pct)`
+  - Updated `agents/pricing.py`: fetches all items to compute avg_cm, classifies each over-target item, enriches Claude payload with `cm`, `avg_cm`, `classification`, `multi_cycle_flag`
+  - Updated `prompts/pricing_system.txt`: classification-aware reasoning rules per quadrant
+  - Created `docs/PRICING_DECISION_TREE.md`: authoritative decision tree reference doc
+  - Added 11 new unit tests (all 21 pricing tests pass)
 
 ---
 
@@ -326,7 +337,12 @@
 | 2026-03-11 | 2A | Built tools/order_calculator.py: calculate_order_quantity() with lead_time+3 buffer formula, rounds up to whole units, urgency flagging; 11 unit tests all pass | Removed tests/__init__.py to fix pytest-asyncio 0.23.0 bug with Python 3.14 |
 | 2026-03-11 | 2B | Built tools/email_sender.py: send_low_stock_alert, send_weekly_report, send_urgent_alert, send_monthly_roi_summary — all HTML emails via Resend async wrapper | RESEND_API_KEY still placeholder; test with real key before deploying |
 | 2026-03-11 | 2C | Created prompts/ordering_system.txt: strict JSON-only prompt with schema, grouping by supplier, urgency flagging, cost calculation rules | Under 1,000 tokens; covers all edge cases including empty input |
+| 2026-03-11 | 3E | Initialized git repo, committed all 22 files (3228 lines), pushed to github.com/jeffrizkallah/POS.Agents on branch master | .env and venv/ correctly excluded by .gitignore |
 | 2026-03-11 | 3D | Built tests/conftest.py, tests/test_db.py (18 tests), tests/test_agents.py (10 tests); added pytest.ini (asyncio_mode=auto); all 39 tests pass. Fixed waste_records column name: quantity_wasted (not quantity). Function-scoped pool fixtures required for pytest-asyncio 0.23.0 + Python 3.14 event loop compatibility |
 | 2026-03-11 | 3C | Wired agents into main.py: replaced placeholder tick with full _run_restaurant() pipeline (inventory scan → draft orders → approval email → waste anomaly check → alert email); per-restaurant try/except isolation; CronTrigger(minute='*/15'), max_instances=1 |
 | 2026-03-11 | 3B | Built agents/ordering.py: draft_purchase_orders() calls calculate_order_quantity, sends payload to Claude Haiku, parses JSON, saves POs with duplicate guard (get_existing_draft_po_today added to DB); send_approval_email() fetches manager email + sends low_stock_alert | Claude call wrapped in asyncio.to_thread; invalid JSON logs failure and skips, never crashes |
 | 2026-03-11 | 3A | Built agents/inventory.py: run_inventory_check() fetches low-stock items, calculates 7-day depletion rates, upserts rates, returns enriched list; detect_waste_anomalies() flags 3× anomalies with pending_approval logs. Added get_waste_by_ingredient() to tools/database.py | math.inf used for days_until_stockout when daily_usage=0 (serialised as null in JSON log) |
+| 2026-03-11 | 4A | Added 5 pricing DB functions to tools/database.py: get_menu_items_with_costs, save_food_cost_snapshot, get_over_target_menu_items, save_pricing_recommendation, get_existing_pricing_recommendation_today. Built agents/pricing.py part 1: save_food_cost_snapshots() | Real table names: food_cost_snapshots (columns: ingredient_cost, selling_price, snapshot_date), ai_pricing_recommendations. menu_item_id is INTEGER not UUID |
+| 2026-03-11 | 4B | Built agents/pricing.py part 2: generate_pricing_recommendations() calls Claude Haiku, enforces 8% max increase guardrail, saves to ai_pricing_recommendations; duplicate guard checks today's pending recs. Created prompts/pricing_system.txt | Claude returns recommendations list; current_food_cost_pct saved alongside projected |
+| 2026-03-11 | 4C | Wired food_cost_snapshot_job (02:00) and pricing_recommendation_job (02:30) into main.py. Built tests/test_pricing.py with 10 tests covering DB helpers, snapshots, recommendations, guardrail, bad JSON, and no-over-target cases | All 49 tests pass (11 calc + 18 db + 10 agents + 10 pricing) |
+| 2026-03-12 | 4D | Created tools/pricing_calculator.py (4 pure functions: calculate_cm, calculate_avg_cm, classify_menu_item, requires_multi_cycle_flag). Updated agents/pricing.py to classify items before calling Claude. Updated prompts/pricing_system.txt with classification-aware rules. Created docs/PRICING_DECISION_TREE.md. Added 11 unit tests. | All 21 pricing tests pass (60 total) |

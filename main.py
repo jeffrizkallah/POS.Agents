@@ -14,11 +14,22 @@ load_dotenv()
 from tools.database import create_pool, get_all_restaurants, get_manager_email
 from agents.inventory import run_inventory_check, detect_waste_anomalies
 from agents.ordering import draft_purchase_orders, send_approval_email
+from agents.pricing import save_food_cost_snapshots, generate_pricing_recommendations
 from tools.email_sender import send_urgent_alert
 
 # Global pool — created once at startup, reused by every job
 pool = None
 scheduler = BackgroundScheduler()
+
+# One persistent event loop shared by all jobs.
+# asyncio.run() creates+closes a loop each call, which breaks the DB pool.
+# Using a single long-lived loop keeps the pool on the correct loop forever.
+_loop = asyncio.new_event_loop()
+
+
+def _run(coro):
+    """Run an async coroutine on the persistent event loop (thread-safe)."""
+    return _loop.run_until_complete(coro)
 
 
 # ---------------------------------------------------------------------------
@@ -139,9 +150,66 @@ async def _async_inventory_and_ordering_job():
 def inventory_and_ordering_job():
     """Sync wrapper called by APScheduler. Delegates to async implementation."""
     try:
-        asyncio.run(_async_inventory_and_ordering_job())
+        _run(_async_inventory_and_ordering_job())
     except Exception as e:
         print(f"[Scheduler Error] inventory_and_ordering_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Pricing jobs (nightly 02:00 snapshots, 02:30 recommendations)
+# ---------------------------------------------------------------------------
+
+async def _async_food_cost_snapshot_job():
+    """Save nightly food cost snapshots for all restaurants (runs at 02:00)."""
+    global pool
+    restaurants = await get_all_restaurants(pool)
+    print(f"[Job] food_cost_snapshot_job — {len(restaurants)} restaurant(s)")
+
+    for restaurant in restaurants:
+        restaurant_id = str(restaurant["id"])
+        restaurant_name = restaurant["name"]
+        try:
+            await save_food_cost_snapshots(pool, restaurant_id, restaurant_name)
+        except Exception as e:
+            print(f"[Job] Snapshot failed for {restaurant_name}: {e}")
+
+    print("[Job] food_cost_snapshot_job complete.")
+
+
+def food_cost_snapshot_job():
+    """Sync wrapper called by APScheduler at 02:00."""
+    try:
+        _run(_async_food_cost_snapshot_job())
+    except Exception as e:
+        print(f"[Scheduler Error] food_cost_snapshot_job crashed: {e}")
+
+
+async def _async_pricing_recommendation_job():
+    """Generate pricing recommendations for over-target items (runs at 02:30)."""
+    global pool
+    restaurants = await get_all_restaurants(pool)
+    print(f"[Job] pricing_recommendation_job — {len(restaurants)} restaurant(s)")
+
+    for restaurant in restaurants:
+        restaurant_id = str(restaurant["id"])
+        restaurant_name = restaurant["name"]
+        target_pct = float(restaurant.get("target_food_cost_pct") or 30.0)
+        try:
+            await generate_pricing_recommendations(
+                pool, restaurant_id, restaurant_name, target_pct
+            )
+        except Exception as e:
+            print(f"[Job] Pricing recommendations failed for {restaurant_name}: {e}")
+
+    print("[Job] pricing_recommendation_job complete.")
+
+
+def pricing_recommendation_job():
+    """Sync wrapper called by APScheduler at 02:30."""
+    try:
+        _run(_async_pricing_recommendation_job())
+    except Exception as e:
+        print(f"[Scheduler Error] pricing_recommendation_job crashed: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +220,7 @@ def handle_shutdown(signum, frame):
     print(f"\n[Shutdown] Signal {signum} received — shutting down gracefully...")
     scheduler.shutdown(wait=False)
     if pool:
-        asyncio.run(pool.close())
+        _run(pool.close())
     print("[Shutdown] Done.")
 
 
@@ -175,8 +243,9 @@ def main():
     # 1. Health check server
     start_health_server()
 
-    # 2. Database pool + startup log
-    restaurant_count = asyncio.run(startup())
+    # 2. Database pool + startup log (use persistent loop — same loop jobs will use)
+    asyncio.set_event_loop(_loop)
+    restaurant_count = _run(startup())
 
     # 3. Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, handle_shutdown)
@@ -188,8 +257,26 @@ def main():
         CronTrigger(minute="*/15"),
         id="inventory_and_ordering",
         name="Inventory & Ordering Check",
-        max_instances=1,       # never run two overlapping instances
-        misfire_grace_time=60, # if a tick is missed, run within 60s or skip
+        max_instances=1,
+        misfire_grace_time=60,
+    )
+
+    scheduler.add_job(
+        food_cost_snapshot_job,
+        CronTrigger(hour=2, minute=0),
+        id="food_cost_snapshot",
+        name="Nightly Food Cost Snapshot",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        pricing_recommendation_job,
+        CronTrigger(hour=2, minute=30),
+        id="pricing_recommendations",
+        name="Nightly Pricing Recommendations",
+        max_instances=1,
+        misfire_grace_time=300,
     )
 
     scheduler.start()

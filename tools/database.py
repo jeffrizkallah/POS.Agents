@@ -300,6 +300,188 @@ async def get_waste_by_ingredient(
         raise
 
 
+async def get_menu_items_with_costs(pool: asyncpg.Pool, restaurant_id: str) -> list[dict]:
+    """Return all available menu items for a restaurant with their calculated food cost.
+
+    Joins menu_items → recipes → recipe_items → ingredients to compute:
+      food_cost = SUM(ingredient.cost_per_unit × recipe_item.quantity_needed)
+    Items with no recipe (no ingredients linked) are included with food_cost = 0.
+    """
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT
+                mi.id            AS menu_item_id,
+                mi.name          AS menu_item_name,
+                mi.price,
+                COALESCE(SUM(i.cost_per_unit * ri.quantity_needed), 0) AS food_cost
+            FROM menu_items mi
+            LEFT JOIN recipes r      ON r.menu_item_id = mi.id
+            LEFT JOIN recipe_items ri ON ri.recipe_id  = r.id
+            LEFT JOIN ingredients i  ON i.id           = ri.ingredient_id
+            WHERE mi.restaurant_id = $1
+              AND mi.is_available  = true
+            GROUP BY mi.id, mi.name, mi.price
+            ORDER BY mi.name
+            """,
+            restaurant_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_menu_items_with_costs(restaurant_id={restaurant_id}): {e}")
+        raise
+
+
+async def save_food_cost_snapshot(
+    pool: asyncpg.Pool,
+    restaurant_id: str,
+    menu_item_id: int,
+    food_cost: float,
+    food_cost_pct: float,
+    price_at_snapshot: float,
+) -> str:
+    """Insert a food cost snapshot row for one menu item. Returns the new row UUID.
+
+    Real column names (confirmed from schema):
+      ingredient_cost = the food cost in dollars
+      selling_price   = menu item price at time of snapshot
+      snapshot_date   = timestamp of the snapshot
+    """
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO food_cost_snapshots
+                (restaurant_id, menu_item_id, ingredient_cost, food_cost_pct,
+                 selling_price, snapshot_date)
+            VALUES ($1, $2, $3, $4, $5, NOW())
+            RETURNING id
+            """,
+            restaurant_id,
+            menu_item_id,
+            food_cost,
+            food_cost_pct,
+            price_at_snapshot,
+        )
+        return str(row_id)
+    except Exception as e:
+        print(
+            f"[DB Error] save_food_cost_snapshot"
+            f"(restaurant_id={restaurant_id}, menu_item_id={menu_item_id}): {e}"
+        )
+        raise
+
+
+async def get_over_target_menu_items(
+    pool: asyncpg.Pool, restaurant_id: str, target_food_cost_pct: float
+) -> list[dict]:
+    """Return the most recent food cost snapshot for each menu item where
+    food_cost_pct exceeds target_food_cost_pct. Used to decide which items
+    need a pricing recommendation."""
+    try:
+        rows = await pool.fetch(
+            """
+            WITH latest AS (
+                SELECT DISTINCT ON (menu_item_id)
+                    menu_item_id,
+                    ingredient_cost,
+                    food_cost_pct,
+                    selling_price
+                FROM food_cost_snapshots
+                WHERE restaurant_id = $1
+                ORDER BY menu_item_id, snapshot_date DESC
+            )
+            SELECT
+                l.menu_item_id,
+                mi.name            AS menu_item_name,
+                l.ingredient_cost  AS food_cost,
+                l.food_cost_pct,
+                l.selling_price    AS current_price
+            FROM latest l
+            JOIN menu_items mi ON mi.id = l.menu_item_id
+            WHERE l.food_cost_pct > $2
+            ORDER BY l.food_cost_pct DESC
+            """,
+            restaurant_id,
+            target_food_cost_pct,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(
+            f"[DB Error] get_over_target_menu_items"
+            f"(restaurant_id={restaurant_id}): {e}"
+        )
+        raise
+
+
+async def save_pricing_recommendation(
+    pool: asyncpg.Pool,
+    restaurant_id: str,
+    menu_item_id: int,
+    current_price: float,
+    recommended_price: float,
+    reasoning: str,
+    current_food_cost_pct: float,
+    projected_food_cost_pct: float,
+) -> str:
+    """Insert a pricing recommendation row. Returns the new row UUID.
+
+    Real table name: ai_pricing_recommendations
+    """
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO ai_pricing_recommendations
+                (restaurant_id, menu_item_id, current_price, recommended_price,
+                 reasoning, current_food_cost_pct, projected_food_cost_pct,
+                 status, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', NOW())
+            RETURNING id
+            """,
+            restaurant_id,
+            menu_item_id,
+            current_price,
+            recommended_price,
+            reasoning,
+            current_food_cost_pct,
+            projected_food_cost_pct,
+        )
+        return str(row_id)
+    except Exception as e:
+        print(
+            f"[DB Error] save_pricing_recommendation"
+            f"(restaurant_id={restaurant_id}, menu_item_id={menu_item_id}): {e}"
+        )
+        raise
+
+
+async def get_existing_pricing_recommendation_today(
+    pool: asyncpg.Pool, restaurant_id: str, menu_item_id: int
+) -> Optional[str]:
+    """Return the id of a pending pricing recommendation created today for this
+    menu item, or None. Used to prevent duplicate nightly recommendations."""
+    try:
+        row = await pool.fetchrow(
+            """
+            SELECT id
+            FROM ai_pricing_recommendations
+            WHERE restaurant_id  = $1
+              AND menu_item_id   = $2
+              AND status         = 'pending'
+              AND created_at    >= NOW()::date
+            LIMIT 1
+            """,
+            restaurant_id,
+            menu_item_id,
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(
+            f"[DB Error] get_existing_pricing_recommendation_today"
+            f"(restaurant_id={restaurant_id}, menu_item_id={menu_item_id}): {e}"
+        )
+        raise
+
+
 async def get_manager_email(pool: asyncpg.Pool, restaurant_id: str) -> Optional[str]:
     """Return the email of the first active manager or owner for a restaurant, or None."""
     try:
