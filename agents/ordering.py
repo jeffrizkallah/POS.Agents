@@ -124,11 +124,40 @@ async def draft_purchase_orders(
         return []
 
     # ------------------------------------------------------------------
-    # Step 2: Call Claude to review and annotate the orders.
+    # Step 2: Duplicate guard — filter out suppliers that already have a
+    # draft PO today. Do this BEFORE calling Claude to avoid wasting tokens.
+    # ------------------------------------------------------------------
+    orderable_items = []
+    for item in enriched_items:
+        supplier_id = item["supplier_id"]
+        supplier_name = item["supplier_name"]
+        try:
+            existing_po_id = await get_existing_draft_po_today(
+                pool, restaurant_id, supplier_id
+            )
+        except Exception:
+            existing_po_id = None  # be conservative — include item
+
+        if existing_po_id:
+            print(
+                f"[Ordering] Skipping {supplier_name} items — draft PO {existing_po_id} "
+                f"already exists for today."
+            )
+        else:
+            orderable_items.append(item)
+
+    if not orderable_items:
+        print(
+            f"[Ordering] All suppliers already have draft POs today for {restaurant_name}."
+        )
+        return []
+
+    # ------------------------------------------------------------------
+    # Step 3: Call Claude to review and annotate the orders.
     # ------------------------------------------------------------------
     claude_payload = {
         "restaurant_name": restaurant_name,
-        "items": enriched_items,
+        "items": orderable_items,
     }
 
     try:
@@ -147,7 +176,7 @@ async def draft_purchase_orders(
         return []
 
     # ------------------------------------------------------------------
-    # Step 3: Save each supplier's order to the database.
+    # Step 4: Save each supplier's order to the database.
     # ------------------------------------------------------------------
     created_orders = []
 
@@ -159,21 +188,6 @@ async def draft_purchase_orders(
 
         if not supplier_id or not items:
             print(f"[Ordering] Skipping order with missing supplier_id or items.")
-            continue
-
-        # Duplicate guard: skip if a draft PO for this supplier already exists today
-        try:
-            existing_po_id = await get_existing_draft_po_today(
-                pool, restaurant_id, supplier_id
-            )
-        except Exception:
-            existing_po_id = None  # be conservative — try to save anyway
-
-        if existing_po_id:
-            print(
-                f"[Ordering] Skipping {supplier_name} — draft PO {existing_po_id} "
-                f"already exists for today."
-            )
             continue
 
         # Build DB lines from Claude's output

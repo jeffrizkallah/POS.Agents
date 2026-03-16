@@ -10,9 +10,9 @@
 
 ## Current Status
 
-- **Current Phase:** 4 — Pricing Agent
-- **Current Chunk:** 4D complete — Classification engine added. Next: Phase 5 (Customer Success Agent)
-- **Last Updated:** March 12, 2026
+- **Current Phase:** 6 — Reporting & Analytics Agent (complete)
+- **Current Chunk:** Next: Internal Platform (see spec below) or Phase 7
+- **Last Updated:** March 16, 2026
 
 ---
 
@@ -26,6 +26,26 @@
 - **The Golden Rule:** Agents observe → reason → act → report. Every action must be logged to `agent_logs`.
 - **Email:** Use Resend API for all notifications. Free tier = 100 emails/day, which is plenty.
 - **Testing:** Always test locally against the real Neon database (use a test restaurant row) before deploying.
+
+---
+
+## Internal Platform (New Project — Build After Phase 6)
+
+> A standalone internal company platform, separate from the POS app and the agents repo. Product-agnostic — designed to manage all products the company sells, not just the POS system.
+
+**Why a new project:** The POS app is a client-facing product. The agents repo is a background worker. Neither is the right place for internal company operations tooling.
+
+**What it will include (v1):**
+- Client management dashboard — all restaurants, health scores, risk levels across all products
+- Subscription / MRR tracking per client
+- Customer success tools — check-in email history, manual notes, onboarding status
+- Agent monitoring — activity logs, last run, recommendations actioned per client
+- Platform intelligence UI — reads from `platform_weekly_summaries` and `client_health_scores`
+- Foundation for managing future products beyond the POS system
+
+**Data source:** Same Neon PostgreSQL DB. The agents (Phase 5 + 6) populate `client_health_scores`, `platform_weekly_summaries`, `analytics_anomalies` — the internal platform just reads and displays them.
+
+**Build order:** Finish Phase 5 + Phase 6 agents first. By then the DB will have real populated data to build the UI against.
 
 ---
 
@@ -214,7 +234,7 @@
 
 > Monitors how restaurants are engaging with the platform and sends proactive check-ins to prevent churn.
 
-- [ ] **5A — Engagement Monitor**
+- [x] **5A — Engagement Monitor**
   - Build `agents/customer_success.py`
   - Implement `check_restaurant_health(restaurant_id)` that scores:
     - Days since last login (check users.last_login or recent orders as proxy)
@@ -224,7 +244,7 @@
   - Return a health score object: `{ score: 0-100, flags: [...], risk_level: "ok"|"at_risk"|"churning" }`
   - Log health checks to agent_logs (status: `completed`, action_type: `health_check`)
 
-- [ ] **5B — Proactive Check-in Emails**
+- [x] **5B — Proactive Check-in Emails**
   - Implement `send_checkin_if_needed(restaurant_id, health)`:
     - If `risk_level == "at_risk"`: send a personalised check-in email with specific insights
     - If `risk_level == "churning"`: send an urgent email with a direct offer to help
@@ -232,7 +252,7 @@
     - Use `send_urgent_alert()` from email_sender.py
   - Add `customer_success_job()` to main.py, scheduled daily at 08:00
 
-- [ ] **5C — Monthly ROI Summary Email**
+- [x] **5C — Monthly ROI Summary Email**
   - Implement `send_monthly_roi_summary(restaurant_id)`:
     - Calculate: total orders processed, total waste cost recorded, purchase orders approved, estimated time saved
     - Format as a clean HTML report email
@@ -241,37 +261,169 @@
 
 ---
 
-## Phase 6: Reporting Agent
+## Phase 6: Reporting & Analytics Agent
 
-> Automatically generates summaries and digests without anyone asking for them.
+> The intelligence layer. Every Monday at 6 AM UTC, calculates 40+ metrics per restaurant, detects anomalies, sends executive-level analytics reports to each owner, and generates an internal platform intelligence briefing. Full spec: `docs/RestaurantOS_Reporting_And_Analytics_Agent.md`.
 
-- [ ] **6A — Weekly Client Performance Summary**
-  - Build `agents/reporting.py`
-  - Implement `send_weekly_summary(restaurant_id)` that emails:
-    - Weekly sales total and order count
-    - Top 5 selling menu items
-    - Food cost % vs target
-    - Total waste cost and top waste reason
-    - Purchase orders approved vs pending
-  - Fetch all data from DB (orders, waste_records, purchase_orders, food_cost_snapshots)
-  - Schedule: every Monday at 07:00
+- [x] **6A — Database Tables**
+  - Run the following 4 new tables in Neon SQL Editor (spec Part 3):
+    - `weekly_report_snapshots` — stores computed metrics per restaurant per week (revenue, food cost, inventory, menu, ops domains + metadata). UNIQUE(restaurant_id, week_start).
+    - `analytics_anomalies` — flags unusual patterns (revenue_drop, food_cost_spike, waste_surge, stock_out_spike, dish_margin_collapse, new_record_high). Severity: info/warning/critical.
+    - `platform_weekly_summaries` — one row per week; platform-wide aggregates (MRR, client health bands, churn, total revenue).
+    - `metric_benchmarks` — pre-loaded industry benchmarks (food_cost_pct=30%, waste_rate_pct=5%, avg_spend_per_cover=$28, etc.). Seeded with 10 rows on CONFLICT DO NOTHING.
+  - Create indexes: idx_weekly_snapshots_restaurant, idx_anomalies_restaurant
+  - Verify all 4 tables exist in Neon console before proceeding
 
-- [ ] **6B — Internal Business Metrics Report**
-  - Implement `send_internal_report()` (for YOU, the SaaS owner, not the restaurant):
-    - Total active restaurants
-    - Total agent actions this week
-    - Agents with most failures
-    - Most active vs least active restaurants
-  - Send to your own email
-  - Schedule: every Monday at 06:00 (before client reports)
+- [x] **6B — New File Structure**
+  - Create folder `tools/metrics/` with empty `__init__.py`
+  - Create 6 empty metric module files:
+    - `tools/metrics/revenue_metrics.py`
+    - `tools/metrics/food_cost_metrics.py`
+    - `tools/metrics/inventory_metrics.py`
+    - `tools/metrics/menu_metrics.py`
+    - `tools/metrics/ops_metrics.py`
+    - `tools/metrics/platform_metrics.py`
+  - Create empty: `tools/anomaly_detector.py`, `tools/report_builder.py`, `agents/reporting.py`
+  - Create empty: `prompts/analytics_narrator.txt`, `prompts/platform_intelligence.txt`
 
-- [ ] **6C — Daily Operations Digest**
-  - Implement `send_daily_digest(restaurant_id)` — a short morning email (like a daily briefing):
-    - Yesterday's sales summary
-    - Any pending purchase orders needing approval
-    - Any critical stock warnings (< 1 day of stock)
-    - Any waste anomalies flagged overnight
-  - Schedule: daily at 07:30
+- [x] **6C — Revenue Metrics Module** (`tools/metrics/revenue_metrics.py`)
+  - `async def get_revenue_metrics(restaurant_id, week_start, week_end) -> dict:`
+    - gross_revenue (SUM paid orders), total_covers, avg_spend_per_cover
+    - prev_week_revenue → revenue_wow_pct (week-over-week %)
+    - four_weeks_ago_revenue → revenue_mom_pct (month-over-month %)
+    - void_count, void_rate_pct
+    - peak_hour (0-23), peak_hour_revenue (EXTRACT HOUR from created_at)
+    - All keys match weekly_report_snapshots columns. COALESCE NULLs to 0.
+  - `async def get_revenue_by_category(restaurant_id, week_start, week_end) -> list:`
+    - JOIN order_items → menu_items → menu_categories
+    - GROUP BY category, SUM revenue, compute pct_of_total. Sort DESC.
+
+- [x] **6D — Food Cost Metrics Module** (`tools/metrics/food_cost_metrics.py`)
+  - `async def get_food_cost_metrics(restaurant_id, week_start, week_end) -> dict:`
+    - food_cost_pct: AVG(food_cost_pct) FROM food_cost_snapshots in window
+    - food_cost_trend: compare current week avg vs 2-week prior avg → 'improving'/'deteriorating'/'stable' (±1% threshold)
+    - top_margin_killer: dish with highest food_cost_pct in window (name + pct)
+    - top_star_dish: dish with lowest food_cost_pct (name + pct)
+    - estimated_margin_loss: SUM of (food_cost_pct - 30)/100 × selling_price × sales_count for dishes > 30%
+    - pricing_agent_recovery: SUM of estimated recovery from accepted ai_pricing_recommendations in window
+  - `async def get_dish_performance(restaurant_id, week_start, week_end) -> list:`
+    - Per menu item: dish_name, food_cost_pct, selling_price, ingredient_cost, classification, sales_count, revenue_contribution. ORDER BY food_cost_pct DESC LIMIT 20.
+
+- [x] **6E — Inventory Metrics Module** (`tools/metrics/inventory_metrics.py`)
+  - `async def get_inventory_metrics(restaurant_id, week_start, week_end) -> dict:`
+    - waste_events from inventory_transactions WHERE type='waste': total qty, event count
+    - total_usage: SUM(ABS(quantity_change)) WHERE type='sale'
+    - waste_rate_pct: waste_qty / (total_usage + waste_qty) × 100
+    - stock_out_count: days where any ingredient had stock_qty = 0
+    - avg_days_stock_cover: AVG(stock_qty / daily_usage) across ingredients with reorder_point > 0
+    - po_cycle_time_days: AVG(received_at - created_at) for completed POs last 30 days
+    - Handle division by zero and NULL with COALESCE
+  - `async def get_waste_by_ingredient(restaurant_id, week_start, week_end) -> list:`
+    - JOIN inventory_transactions → ingredients WHERE type='waste'. GROUP BY ingredient. ORDER BY total_wasted DESC LIMIT 10.
+
+- [x] **6F — Menu + Ops Metrics Modules**
+  - `tools/metrics/menu_metrics.py` — `async def get_menu_metrics(...) -> dict:`
+    - top_dish (name + count from order_items for paid orders)
+    - star_to_dog_ratio: count(classification IN ('Star','Plow Horse')) / total items
+    - attachment_rate: COUNT sides+drinks order_items / COUNT mains order_items
+    - category_mix: GROUP BY category, COUNT, percent of total
+    - Returns: top_dish_name, top_dish_count, star_to_dog_ratio, attachment_rate
+  - `async def get_full_menu_performance(...) -> list:` — name, category, sales_count, revenue, food_cost_pct, classification. ORDER BY sales_count DESC.
+  - `tools/metrics/ops_metrics.py` — `async def get_ops_metrics(...) -> dict:`
+    - table_turn_rate: COUNT(paid orders) / COUNT(tables) / 7
+    - orders_by_hour: list of {hour: int, count: int} for all 24 hours
+    - recommendation_action_rate: actioned ai_pricing_recommendations / total in window × 100
+    - agent_run_count: COUNT FROM agent_logs in window for this restaurant
+    - login_frequency: {total_logins, unique_days} from login_events in window
+
+- [x] **6G — Platform Metrics Module** (`tools/metrics/platform_metrics.py`)
+  - `async def get_platform_metrics(week_start, week_end) -> dict:` — NO restaurant_id filter, platform-wide:
+    - total_active_clients (subscriptions WHERE status IN ('active','trialing'))
+    - total_mrr, mrr_at_risk (JOIN client_health_scores WHERE score_band IN ('at_risk','critical'))
+    - avg_client_health (AVG total_score from client_health_scores WHERE score_date = today)
+    - clients_by_band: dict {band: count} from client_health_scores
+    - new_clients_this_week, churned_this_week (from subscriptions created_at/cancelled_at)
+    - total_platform_revenue, total_platform_covers (SUM across all restaurants)
+    - avg_food_cost_pct (AVG from food_cost_snapshots in window)
+    - agent_total_runs (COUNT from agent_logs in window)
+    - feature_adoption_pct: % of restaurants using all 3 key features (pricing, POs, waste)
+  - `async def get_client_league_table(week_start, week_end) -> list:`
+    - Per active restaurant: name, gross_revenue, food_cost_pct, health_score, recommendation_action_rate. ORDER BY gross_revenue DESC.
+
+- [x] **6H — Anomaly Detector** (`tools/anomaly_detector.py`)
+  - `async def detect_anomalies(restaurant_id, current_metrics, previous_metrics) -> list:`
+    - Revenue drop: current < previous × 0.80 → severity='critical', type='revenue_drop'
+    - Revenue spike: current > previous × 1.25 → severity='info', type='revenue_spike'
+    - Food cost spike: current food_cost_pct > previous + 3 → severity='warning', type='food_cost_spike'
+    - Waste surge: current waste_rate_pct > previous + 2 → severity='warning', type='waste_surge'
+    - Stock-out spike: current stock_out_count > previous + 2 → severity='warning', type='stock_out_spike'
+    - New record: current gross_revenue > all-time max → severity='info', type='new_record_high'
+    - Margin collapse: top_margin_killer_pct > 45 → severity='critical', type='dish_margin_collapse'
+    - For each: calculate change_pct, save to analytics_anomalies (ON CONFLICT DO NOTHING), return list
+  - Helper: `async def get_all_time_max_revenue(restaurant_id)` — SELECT MAX(gross_revenue) FROM weekly_report_snapshots
+  - Helper: `async def get_previous_week_metrics(restaurant_id, week_start)` — fetch prior week snapshot dict
+  - Helper: `async def save_anomaly(...)` — INSERT into analytics_anomalies
+
+- [x] **6I — Report Builder** (`tools/report_builder.py`)
+  - `async def build_report_package(restaurant_id, restaurant_name, week_start, week_end) -> dict:`
+    1. Run all 5 metric modules concurrently with asyncio.gather()
+    2. Fetch benchmarks from metric_benchmarks as {metric_name: benchmark_value}
+    3. Fetch previous week's snapshot from weekly_report_snapshots for comparison
+    4. Compute benchmark comparisons for food_cost_pct, waste_rate_pct, avg_spend_per_cover, table_turn_rate: {value, benchmark, vs_benchmark, better_than_benchmark}
+    5. Upsert core metrics to weekly_report_snapshots
+    6. Run detect_anomalies() comparing current vs previous week
+    7. Return full package dict: {restaurant_name, week_start, week_end, revenue, food_cost, inventory, menu, ops, benchmarks, anomalies, previous_week}
+  - Wrap in try/except — return empty dict on failure
+
+- [x] **6J — Claude Prompts**
+  - `prompts/analytics_narrator.txt` — instructs Claude to write report narrative sections as raw JSON only (no markdown fences). Fields: headline, executive_summary, revenue_narrative, food_cost_narrative, inventory_narrative, menu_narrative, ops_narrative, anomaly_highlights (array with title/description/severity/action), top_recommendation, benchmark_commentary, closing. Style rules: exact numbers, short paragraphs, write for busy restaurant owner, no buzzwords. (Full prompt text in spec Part 8 Step 9.)
+  - `prompts/platform_intelligence.txt` — instructs Claude to write internal platform briefing as raw JSON. Fields: week_headline, mrr_commentary, health_distribution_commentary, top_performer, most_at_risk, platform_revenue_commentary, feature_adoption_commentary, agent_performance_commentary, three_priorities (array), one_thing_going_well, one_thing_to_watch. Rules: exact numbers, actionable priorities, write like briefing a co-founder. (Full prompt text in spec Part 8 Step 10.)
+
+- [x] **6K — New Email Functions** (add to `tools/email_sender.py`)
+  - `send_analytics_report(to_email, restaurant_name, report_package, narrative)`:
+    - Header: indigo bg, white text, week dates
+    - Headline (narrative['headline']) in large bold indigo
+    - Executive Summary box
+    - Anomaly alert cards (red=critical, amber=warning, blue=info) with title + description + action
+    - 4 metric cards (2×2 grid): Revenue, Food Cost, Inventory, Menu — each with key numbers + narrative
+    - Benchmark comparison section
+    - Top Recommendation highlighted box
+    - Footer with dashboard link
+    - Subject: `f'Weekly Analytics: {restaurant_name} — w/e {week_end_date}'`
+  - `send_platform_intelligence(to_email, platform_narrative, platform_metrics, league_table)`:
+    - Dark header, week headline, 4 KPI cards (MRR, MRR at Risk, Avg Health Score, Active Clients)
+    - Client health band visual, Three Priorities numbered list
+    - Client League Table (top 5 by revenue), one_thing_going_well (green), one_thing_to_watch (amber)
+    - Subject: `f'Platform Intelligence — Week of {date}'`
+
+- [x] **6L — Main Reporting Agent** (`agents/reporting.py`)
+  - `async def run_reporting_agent():`
+    - Calculate window: week_end = today - 1 day, week_start = week_end - 6 days
+    - **Phase 1 — Per-restaurant reports:** for each client in get_active_clients():
+      - Call build_report_package() — skip if empty
+      - Load analytics_narrator.txt, call Claude (claude-sonnet-4-6, max_tokens=3000), parse JSON narrative
+      - Fetch owner email from users table (role='owner' or 'manager')
+      - Call send_analytics_report()
+      - UPDATE weekly_report_snapshots SET report_sent=TRUE
+      - log_agent_action(action_type='analytics_report_sent')
+      - asyncio.sleep(3) between clients
+    - **Phase 2 — Platform intelligence:**
+      - get_platform_metrics() + get_client_league_table()
+      - Upsert to platform_weekly_summaries
+      - Load platform_intelligence.txt, call Claude (max_tokens=2000), parse JSON narrative
+      - send_platform_intelligence() to PLATFORM_REPORT_EMAIL env var
+      - log_agent_action(action_type='platform_intelligence_sent')
+    - **Final:** send_slack_alert() with summary (reports sent, total revenue, anomalies, runtime)
+    - log_agent_action(action_type='weekly_run_complete')
+  - Schedule: CronTrigger(day_of_week='mon', hour=6, minute=0) in main.py
+  - Add `from agents.reporting import run_reporting_agent` to main.py imports
+
+- [x] **6M — Seed Test Data + Test Suite**
+  - Seed SQL (spec Part 13 Step 11): DO $$ block creating 5 paid orders/day × 14 days for test restaurant + order_items. Verify with SELECT COUNT/SUM query.
+  - Create `test_reporting_modules.py`: runs all 4 metric modules against real DB for first restaurant, prints JSON output. Run: `python test_reporting_modules.py`.
+  - Create `test_reporting.py`: calls `asyncio.run(run_reporting_agent())`. Run: `python test_reporting.py`.
+  - Expected output: report window logged, N clients processed, revenue + food cost printed per restaurant, Phase 2 platform intelligence built, Reporting Agent done.
+  - Verify in Neon: weekly_report_snapshots row exists, analytics_anomalies detected, platform_weekly_summaries saved, agent_logs entry with action_type='weekly_run_complete'.
 
 ---
 
@@ -346,3 +498,8 @@
 | 2026-03-11 | 4B | Built agents/pricing.py part 2: generate_pricing_recommendations() calls Claude Haiku, enforces 8% max increase guardrail, saves to ai_pricing_recommendations; duplicate guard checks today's pending recs. Created prompts/pricing_system.txt | Claude returns recommendations list; current_food_cost_pct saved alongside projected |
 | 2026-03-11 | 4C | Wired food_cost_snapshot_job (02:00) and pricing_recommendation_job (02:30) into main.py. Built tests/test_pricing.py with 10 tests covering DB helpers, snapshots, recommendations, guardrail, bad JSON, and no-over-target cases | All 49 tests pass (11 calc + 18 db + 10 agents + 10 pricing) |
 | 2026-03-12 | 4D | Created tools/pricing_calculator.py (4 pure functions: calculate_cm, calculate_avg_cm, classify_menu_item, requires_multi_cycle_flag). Updated agents/pricing.py to classify items before calling Claude. Updated prompts/pricing_system.txt with classification-aware rules. Created docs/PRICING_DECISION_TREE.md. Added 11 unit tests. | All 21 pricing tests pass (60 total) |
+| 2026-03-12 | 4E | Added estimate_volume_impact() and get_sales_data_status() to pricing_calculator.py. Added get_sales_volume_by_menu_item() to database.py. Updated agents/pricing.py to fetch 30-day sales volumes, pass to Claude, and compute post-recommendation volume impact via elasticity (-1.5). Volume note appended to reasoning; rec dict now includes projected_volume_change_pct, units_sold_30d, sales_data_status. Updated pricing_system.txt with sales data strategy + no-history fallback rules. Added 6 unit tests. | All 27 pricing tests pass |
+| 2026-03-12 | 4F | Fixed: accepted price recommendations now apply to menu_items.price. Added get_approved_pricing_recommendations() + apply_pricing_recommendation() to database.py. Added apply_approved_recommendations() to agents/pricing.py (polls every 15 min alongside inventory job). Fixed: inventory "no low-stock" events no longer written to agent_logs (console-only) — prevents log spam on agents page. | |
+| 2026-03-14 | 5A–5C | Built agents/customer_success.py: check_restaurant_health() scores 0–100 across 4 signals (login recency, order stability, food cost trend, recipe coverage); send_checkin_if_needed() emails at_risk/churning restaurants; send_monthly_roi_summary_email() runs 1st of month. Added 6 DB helpers to database.py. Added send_checkin_email() to email_sender.py. Wired customer_success_job (daily 08:00) + monthly_roi_job (1st of month 09:00) into main.py. 21 new tests — all 81 pass. | users.last_login falls back gracefully to None if column absent |
+| 2026-03-16 | cost-fix | Moved ordering agent duplicate guard to before Claude call. Previously Claude was called every 15 min even when POs already existed for the day. Now filters out already-covered suppliers first and skips Claude entirely if all suppliers have draft POs today. | |
+| 2026-03-16 | 6A–6M | Built full Reporting & Analytics Agent. SQL provided for 4 new tables (weekly_report_snapshots, analytics_anomalies, platform_weekly_summaries, metric_benchmarks). Created tools/metrics/ with 6 modules (revenue, food_cost, inventory, menu, ops, platform). Built tools/anomaly_detector.py (7 anomaly types: revenue_drop/spike, new_record_high, food_cost_spike, waste_surge, stock_out_spike, dish_margin_collapse). Built tools/report_builder.py: runs all metrics concurrently with asyncio.gather(), benchmark comparisons, upserts snapshot, detects anomalies. Added 2 Claude prompts (analytics_narrator + platform_intelligence, JSON-only). Added send_analytics_report() + send_platform_intelligence() to email_sender.py. Added 3 DB helpers (get_active_clients, mark_report_sent, upsert_platform_weekly_summary). Built agents/reporting.py with full Phase 1 (per-restaurant) + Phase 2 (platform intelligence) pipeline using claude-sonnet-4-6. Wired CronTrigger(day_of_week='mon', hour=6) into main.py. 16 new tests in test_reporting.py. | subscriptions/client_health_scores tables queried defensively (may not exist yet); revenue computed from order_items×price; PLATFORM_REPORT_EMAIL env var required for platform email |

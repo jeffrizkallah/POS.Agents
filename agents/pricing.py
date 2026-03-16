@@ -24,9 +24,12 @@ from pathlib import Path
 import anthropic
 
 from tools.database import (
+    apply_pricing_recommendation,
+    get_approved_pricing_recommendations,
     get_menu_items_with_costs,
     get_over_target_menu_items,
     get_existing_pricing_recommendation_today,
+    get_sales_volume_by_menu_item,
     log_agent_action,
     save_food_cost_snapshot,
     save_pricing_recommendation,
@@ -35,12 +38,14 @@ from tools.pricing_calculator import (
     calculate_avg_cm,
     calculate_cm,
     classify_menu_item,
+    estimate_volume_impact,
+    get_sales_data_status,
     requires_multi_cycle_flag,
 )
 
 AGENT_NAME = "pricing_agent"
 CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-MAX_TOKENS = 1024
+MAX_TOKENS = 2000
 MAX_PRICE_INCREASE_PCT = 8.0  # never suggest more than 8% in one step
 
 _PROMPT_PATH = Path(__file__).parent.parent / "prompts" / "pricing_system.txt"
@@ -207,7 +212,10 @@ async def generate_pricing_recommendations(
          for i in all_items]
     )
 
-    # Call Claude for pricing suggestions
+    # Fetch 30-day sales volume data for all menu items in one query
+    volume_by_item = await get_sales_volume_by_menu_item(pool, restaurant_id, days=30)
+
+    # Build enriched payload for Claude
     classified_items = []
     for item in pending_items:
         current_price = float(item["current_price"])
@@ -218,8 +226,11 @@ async def generate_pricing_recommendations(
         multi_cycle = requires_multi_cycle_flag(
             current_price, food_cost, target_food_cost_pct, MAX_PRICE_INCREASE_PCT
         )
+        item_id = int(item["menu_item_id"])
+        units_sold_30d = volume_by_item.get(item_id, 0)
+        sales_status = get_sales_data_status(units_sold_30d)
         classified_items.append({
-            "menu_item_id": int(item["menu_item_id"]),
+            "menu_item_id": item_id,
             "name": item["menu_item_name"],
             "current_price": current_price,
             "food_cost": food_cost,
@@ -228,6 +239,8 @@ async def generate_pricing_recommendations(
             "avg_cm": avg_cm,
             "classification": classification,
             "multi_cycle_flag": multi_cycle,
+            "units_sold_30d": units_sold_30d,
+            "sales_data_status": sales_status,
         })
 
     claude_payload = {
@@ -244,8 +257,8 @@ async def generate_pricing_recommendations(
             pool=pool,
             restaurant_id=restaurant_id,
             agent_name=AGENT_NAME,
-            action_type="claude_error",
-            summary=f"Claude API call failed for pricing at {restaurant_name}: {e}",
+            action_type="service_error",
+            summary=f"Could not generate pricing recommendations for {restaurant_name}. The AI service returned an unexpected response.",
             data={"error": str(e)},
             status="failed",
         )
@@ -289,18 +302,53 @@ async def generate_pricing_recommendations(
         )
 
         # Enforce the 8% max increase guardrail
+        price_change_pct = 0.0
         if current_price > 0:
-            increase_pct = ((recommended_price - current_price) / current_price) * 100
-            if increase_pct > MAX_PRICE_INCREASE_PCT:
+            price_change_pct = ((recommended_price - current_price) / current_price) * 100
+            if price_change_pct > MAX_PRICE_INCREASE_PCT:
                 recommended_price = round(
                     current_price * (1 + MAX_PRICE_INCREASE_PCT / 100), 2
                 )
+                price_change_pct = MAX_PRICE_INCREASE_PCT
                 projected_pct = round(
                     (item_food_cost / recommended_price) * 100, 2
                 ) if recommended_price > 0 else projected_pct
                 reasoning += (
                     f" (Capped at {MAX_PRICE_INCREASE_PCT}% max increase guardrail.)"
                 )
+
+        # Compute sales volume impact using price elasticity of demand
+        matched_item = next(
+            (i for i in classified_items if i["menu_item_id"] == menu_item_id),
+            None,
+        )
+        units_sold_30d = matched_item["units_sold_30d"] if matched_item else 0
+        sales_status = matched_item["sales_data_status"] if matched_item else "none"
+        volume_impact = estimate_volume_impact(price_change_pct)
+        volume_change_pct = volume_impact["volume_change_pct"]
+
+        abs_vol = abs(volume_change_pct)
+        if sales_status == "none":
+            volume_note = (
+                f"Est. volume impact: ~{abs_vol:.1f}% fewer covers "
+                f"after a +{price_change_pct:.1f}% price increase. "
+                f"No sales history for this item — benchmark estimate only. "
+                f"Monitor closely after the change."
+            )
+        elif sales_status == "limited":
+            volume_note = (
+                f"Est. volume impact: ~{abs_vol:.1f}% fewer covers "
+                f"after a +{price_change_pct:.1f}% price increase "
+                f"({units_sold_30d} units sold in last 30 days — limited data, treat as estimate)."
+            )
+        else:
+            volume_note = (
+                f"Est. volume impact: ~{abs_vol:.1f}% fewer covers "
+                f"after a +{price_change_pct:.1f}% price increase "
+                f"({units_sold_30d} units sold in last 30 days)."
+            )
+
+        reasoning = f"{reasoning} {volume_note}"
 
         try:
             rec_id = await save_pricing_recommendation(
@@ -329,8 +377,13 @@ async def generate_pricing_recommendations(
             "menu_item_name": item_name,
             "current_price": current_price,
             "recommended_price": recommended_price,
+            "price_change_pct": round(price_change_pct, 2),
             "reasoning": reasoning,
+            "current_food_cost_pct": current_food_cost_pct,
             "projected_food_cost_pct": projected_pct,
+            "projected_volume_change_pct": volume_change_pct,
+            "units_sold_30d": units_sold_30d,
+            "sales_data_status": sales_status,
         }
         saved.append(saved_rec)
 
@@ -342,7 +395,8 @@ async def generate_pricing_recommendations(
             summary=(
                 f"Price recommendation for {item_name}: "
                 f"AED {current_price:.2f} -> AED {recommended_price:.2f} "
-                f"(food cost {projected_pct:.1f}%)."
+                f"(+{price_change_pct:.1f}%, food cost {projected_pct:.1f}%, "
+                f"est. volume {volume_change_pct:+.1f}%)."
             ),
             data=saved_rec,
             status="pending_approval",
@@ -352,13 +406,94 @@ async def generate_pricing_recommendations(
         print(
             f"[Pricing] Recommendation: {item_name} "
             f"AED {current_price:.2f} -> AED {recommended_price:.2f} "
-            f"(food cost {projected_pct:.1f}%)"
+            f"(+{price_change_pct:.1f}%, food cost {projected_pct:.1f}%, "
+            f"est. volume {volume_change_pct:+.1f}%, "
+            f"sales data: {sales_status})"
         )
 
     print(
         f"[Pricing] Saved {len(saved)} pricing recommendations for {restaurant_name}."
     )
     return saved
+
+
+# ---------------------------------------------------------------------------
+# Part 3: Apply approved recommendations (runs every 15 min alongside inventory)
+# ---------------------------------------------------------------------------
+
+
+async def apply_approved_recommendations(
+    pool,
+    restaurant_id: str,
+    restaurant_name: str,
+) -> list[dict]:
+    """Check for approved pricing recommendations and apply them to menu_items.price.
+
+    When a manager accepts a recommendation in the POS dashboard the row status
+    changes to 'approved'. This function:
+      1. Fetches all 'approved' recommendations for the restaurant.
+      2. Updates menu_items.price to the recommended_price.
+      3. Marks the recommendation as 'applied'.
+      4. Logs each price change to agent_logs so it appears in the Agents page.
+
+    Returns a list of applied recommendation dicts.
+    """
+    approved = await get_approved_pricing_recommendations(pool, restaurant_id)
+
+    if not approved:
+        return []
+
+    applied = []
+    for rec in approved:
+        rec_id = str(rec["id"])
+        menu_item_id = int(rec["menu_item_id"])
+        new_price = float(rec["recommended_price"])
+        old_price = float(rec["current_price"])
+
+        try:
+            await apply_pricing_recommendation(pool, rec_id, menu_item_id, new_price)
+        except Exception as e:
+            print(
+                f"[Pricing] Failed to apply recommendation {rec_id} "
+                f"for menu item {menu_item_id}: {e}"
+            )
+            continue
+
+        change_pct = ((new_price - old_price) / old_price * 100) if old_price > 0 else 0.0
+        applied_rec = {
+            "rec_id": rec_id,
+            "menu_item_id": menu_item_id,
+            "old_price": old_price,
+            "new_price": new_price,
+            "change_pct": round(change_pct, 2),
+        }
+        applied.append(applied_rec)
+
+        await log_agent_action(
+            pool=pool,
+            restaurant_id=restaurant_id,
+            agent_name=AGENT_NAME,
+            action_type="price_updated",
+            summary=(
+                f"Price updated for menu item #{menu_item_id}: "
+                f"AED {old_price:.2f} → AED {new_price:.2f} "
+                f"(+{change_pct:.1f}%) — recommendation approved and applied."
+            ),
+            data=applied_rec,
+            status="completed",
+        )
+
+        print(
+            f"[Pricing] Applied price change for item {menu_item_id}: "
+            f"AED {old_price:.2f} → AED {new_price:.2f}"
+        )
+
+    if applied:
+        print(
+            f"[Pricing] Applied {len(applied)} approved price change(s) for {restaurant_name}."
+        )
+
+    return applied
 
 
 # ---------------------------------------------------------------------------

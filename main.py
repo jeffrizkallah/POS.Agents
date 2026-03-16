@@ -14,7 +14,17 @@ load_dotenv()
 from tools.database import create_pool, get_all_restaurants, get_manager_email
 from agents.inventory import run_inventory_check, detect_waste_anomalies
 from agents.ordering import draft_purchase_orders, send_approval_email
-from agents.pricing import save_food_cost_snapshots, generate_pricing_recommendations
+from agents.pricing import (
+    apply_approved_recommendations,
+    save_food_cost_snapshots,
+    generate_pricing_recommendations,
+)
+from agents.customer_success import (
+    check_restaurant_health,
+    send_checkin_if_needed,
+    send_monthly_roi_summary_email,
+)
+from agents.reporting import run_reporting_agent
 from tools.email_sender import send_urgent_alert
 
 # Global pool — created once at startup, reused by every job
@@ -144,6 +154,15 @@ async def _async_inventory_and_ordering_job():
     for restaurant in restaurants:
         await _run_restaurant(restaurant)
 
+    # Apply any pricing recommendations that were approved in the POS dashboard
+    for restaurant in restaurants:
+        restaurant_id = str(restaurant["id"])
+        restaurant_name = restaurant["name"]
+        try:
+            await apply_approved_recommendations(pool, restaurant_id, restaurant_name)
+        except Exception as e:
+            print(f"[Job] Price application failed for {restaurant_name}: {e}")
+
     print("[Job] inventory_and_ordering_job complete.")
 
 
@@ -213,6 +232,85 @@ def pricing_recommendation_job():
 
 
 # ---------------------------------------------------------------------------
+# Customer success job (daily 08:00 health checks + check-in emails)
+# ---------------------------------------------------------------------------
+
+async def _async_customer_success_job():
+    """Run engagement health checks for all restaurants and send check-in emails."""
+    global pool
+    restaurants = await get_all_restaurants(pool)
+    print(f"[Job] customer_success_job — {len(restaurants)} restaurant(s)")
+
+    for restaurant in restaurants:
+        restaurant_id = str(restaurant["id"])
+        restaurant_name = restaurant["name"]
+        try:
+            health = await check_restaurant_health(pool, restaurant_id, restaurant_name)
+            await send_checkin_if_needed(pool, restaurant_id, restaurant_name, health)
+        except Exception as e:
+            print(f"[Job] Customer success check failed for {restaurant_name}: {e}")
+
+    print("[Job] customer_success_job complete.")
+
+
+def customer_success_job():
+    """Sync wrapper called by APScheduler at 08:00."""
+    try:
+        _run(_async_customer_success_job())
+    except Exception as e:
+        print(f"[Scheduler Error] customer_success_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Monthly ROI summary job (1st of each month, 09:00)
+# ---------------------------------------------------------------------------
+
+async def _async_monthly_roi_job():
+    """Send monthly ROI summary emails to all restaurant managers."""
+    global pool
+    restaurants = await get_all_restaurants(pool)
+    print(f"[Job] monthly_roi_job — {len(restaurants)} restaurant(s)")
+
+    for restaurant in restaurants:
+        restaurant_id = str(restaurant["id"])
+        restaurant_name = restaurant["name"]
+        try:
+            await send_monthly_roi_summary_email(pool, restaurant_id, restaurant_name)
+        except Exception as e:
+            print(f"[Job] Monthly ROI email failed for {restaurant_name}: {e}")
+
+    print("[Job] monthly_roi_job complete.")
+
+
+def monthly_roi_job():
+    """Sync wrapper called by APScheduler on the 1st of each month at 09:00."""
+    try:
+        _run(_async_monthly_roi_job())
+    except Exception as e:
+        print(f"[Scheduler Error] monthly_roi_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Weekly reporting job (Monday 06:00 UTC)
+# ---------------------------------------------------------------------------
+
+async def _async_reporting_job():
+    """Run the full weekly reporting & analytics pipeline."""
+    global pool
+    print("[Job] reporting_job — starting weekly analytics run")
+    await run_reporting_agent(pool)
+    print("[Job] reporting_job complete.")
+
+
+def reporting_job():
+    """Sync wrapper called by APScheduler every Monday at 06:00."""
+    try:
+        _run(_async_reporting_job())
+    except Exception as e:
+        print(f"[Scheduler Error] reporting_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 
@@ -277,6 +375,33 @@ def main():
         name="Nightly Pricing Recommendations",
         max_instances=1,
         misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        customer_success_job,
+        CronTrigger(hour=8, minute=0),
+        id="customer_success",
+        name="Daily Customer Success Health Check",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        monthly_roi_job,
+        CronTrigger(day=1, hour=9, minute=0),
+        id="monthly_roi_summary",
+        name="Monthly ROI Summary Email",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        reporting_job,
+        CronTrigger(day_of_week="mon", hour=6, minute=0),
+        id="weekly_reporting",
+        name="Weekly Reporting & Analytics",
+        max_instances=1,
+        misfire_grace_time=3600,
     )
 
     scheduler.start()

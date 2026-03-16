@@ -79,3 +79,45 @@ def requires_multi_cycle_flag(
     max_allowed_price = current_price * (1 + max_increase_pct / 100)
     target_price_needed = ingredient_cost / (target_food_cost_pct / 100)
     return target_price_needed > max_allowed_price
+
+
+def estimate_volume_impact(price_change_pct: float, elasticity: float = -1.5) -> dict:
+    """Estimate expected volume change from a price increase using price elasticity of demand.
+
+    The default elasticity of -1.5 is a conservative restaurant industry benchmark
+    (a 1% price increase reduces unit sales by ~1.5%).
+
+    Args:
+        price_change_pct: Percentage change in price (positive = price increase).
+        elasticity: Price elasticity of demand. Default -1.5 (industry benchmark).
+
+    Returns:
+        {"volume_change_pct": float, "interpretation": str}
+    """
+    volume_change_pct = round(elasticity * price_change_pct, 1)
+    abs_vol = abs(volume_change_pct)
+    if volume_change_pct < 0:
+        interpretation = f"~{abs_vol:.1f}% fewer units expected."
+    elif volume_change_pct > 0:
+        interpretation = f"~{abs_vol:.1f}% more units expected."
+    else:
+        interpretation = "No expected volume change."
+    return {"volume_change_pct": volume_change_pct, "interpretation": interpretation}
+
+
+def get_sales_data_status(units_sold: int) -> str:
+    """Classify the statistical reliability of sales history for a menu item.
+
+    Thresholds (based on 30-day window):
+      "sufficient" — 30+ units: reliable elasticity estimates possible
+      "limited"    — 5–29 units: some history but statistically weak
+      "none"       — 0–4 units: no meaningful sales history; use benchmark assumptions
+
+    Returns one of: "sufficient", "limited", "none"
+    """
+    if units_sold >= 30:
+        return "sufficient"
+    elif units_sold >= 5:
+        return "limited"
+    else:
+        return "none"

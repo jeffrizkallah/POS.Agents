@@ -17,6 +17,8 @@ from tools.pricing_calculator import (
     calculate_cm,
     calculate_avg_cm,
     classify_menu_item,
+    estimate_volume_impact,
+    get_sales_data_status,
     requires_multi_cycle_flag,
 )
 
@@ -95,6 +97,39 @@ def test_requires_multi_cycle_flag_false():
 
 def test_requires_multi_cycle_flag_zero_price():
     assert requires_multi_cycle_flag(0.0, 5.0, 30.0, 8.0) is False
+
+
+def test_estimate_volume_impact_price_increase():
+    result = estimate_volume_impact(8.0)  # 8% price increase
+    # elasticity -1.5 × 8 = -12%
+    assert result["volume_change_pct"] == -12.0
+    assert "fewer" in result["interpretation"]
+
+
+def test_estimate_volume_impact_zero():
+    result = estimate_volume_impact(0.0)
+    assert result["volume_change_pct"] == 0.0
+    assert "No expected" in result["interpretation"]
+
+
+def test_estimate_volume_impact_custom_elasticity():
+    result = estimate_volume_impact(10.0, elasticity=-2.0)
+    assert result["volume_change_pct"] == -20.0
+
+
+def test_get_sales_data_status_sufficient():
+    assert get_sales_data_status(30) == "sufficient"
+    assert get_sales_data_status(100) == "sufficient"
+
+
+def test_get_sales_data_status_limited():
+    assert get_sales_data_status(5) == "limited"
+    assert get_sales_data_status(29) == "limited"
+
+
+def test_get_sales_data_status_none():
+    assert get_sales_data_status(0) == "none"
+    assert get_sales_data_status(4) == "none"
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +289,16 @@ async def test_generate_pricing_recommendations_item_shape(pool, demo_restaurant
         assert "current_price" in rec
         assert "recommended_price" in rec
         assert "reasoning" in rec
+        assert "current_food_cost_pct" in rec
+        assert "projected_volume_change_pct" in rec
+        assert "units_sold_30d" in rec
+        assert "sales_data_status" in rec
+        assert rec["sales_data_status"] in ("sufficient", "limited", "none")
         assert float(rec["recommended_price"]) >= float(rec["current_price"]), (
             "recommended_price must not be lower than current_price"
+        )
+        assert "Est. volume impact:" in rec["reasoning"], (
+            "reasoning must include volume impact section"
         )
 
 
