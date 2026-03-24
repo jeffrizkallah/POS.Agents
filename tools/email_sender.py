@@ -835,12 +835,8 @@ async def _send(to_email: str, subject: str, html: str) -> None:
     resend.api_key = os.environ.get("RESEND_API_KEY", "")
     from_email = _get_from_email()
 
-    params = resend.Emails.SendParams(
-        from_=from_email,
-        to=[to_email],
-        subject=subject,
-        html=html,
-    )
+    # resend==2.0.0 stores key as 'from_' but API expects 'from'
+    params: dict = {"from": from_email, "to": [to_email], "subject": subject, "html": html}
 
     try:
         result = await asyncio.to_thread(resend.Emails.send, params)

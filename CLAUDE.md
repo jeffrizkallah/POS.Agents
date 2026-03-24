@@ -10,3 +10,6 @@
    - Mark completed chunks with `[x]`
    - Add an entry to the Chunk Completion Log table
    - Update the "Current Status" section (phase, chunk, date)
+
+**Running SQL to Neon automatically:**
+- always run the sql to neon DB yourself

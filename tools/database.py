@@ -811,6 +811,402 @@ async def upsert_platform_weekly_summary(
         print(f"[DB Error] upsert_platform_weekly_summary(week_start={week_start}): {e}")
 
 
+# ---------------------------------------------------------------------------
+# Phase 7: Multi-Client Foundation — DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_all_clients(pool: asyncpg.Pool) -> list[dict]:
+    """Return all active clients from the clients table."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, name, owner_email, owner_whatsapp, timezone, currency, is_active, created_at
+            FROM clients
+            WHERE is_active = TRUE
+            ORDER BY name
+            """
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_all_clients: {e}")
+        raise
+
+
+async def get_brands_for_client(pool: asyncpg.Pool, client_id: str) -> list[dict]:
+    """Return all active brands for a client."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, name, industry, business_model, primary_channel,
+                   tone, language_primary, language_secondary, target_audience,
+                   avg_deal_value, avg_customer_ltv, currency, roi_target_multiplier,
+                   is_active, created_at
+            FROM brands
+            WHERE client_id = $1
+              AND is_active = TRUE
+            ORDER BY name
+            """,
+            client_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_brands_for_client(client_id={client_id}): {e}")
+        raise
+
+
+async def get_brand_channels(pool: asyncpg.Pool, brand_id: str) -> list[dict]:
+    """Return all active platform credentials for a brand."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, brand_id, platform, account_id, access_token, is_active, created_at
+            FROM brand_channels
+            WHERE brand_id = $1
+              AND is_active = TRUE
+            ORDER BY platform
+            """,
+            brand_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_brand_channels(brand_id={brand_id}): {e}")
+        raise
+
+
+async def get_brand_config(pool: asyncpg.Pool, brand_id: str) -> Optional[dict]:
+    """Return the full brand row (tone, language, audience, ROI target, etc.), or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            SELECT id, client_id, name, industry, business_model, primary_channel,
+                   tone, language_primary, language_secondary, target_audience,
+                   avg_deal_value, avg_customer_ltv, currency, roi_target_multiplier,
+                   is_active, created_at
+            FROM brands
+            WHERE id = $1
+            """,
+            brand_id,
+        )
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[DB Error] get_brand_config(brand_id={brand_id}): {e}")
+        raise
+
+
+async def get_brand_content_config(pool: asyncpg.Pool, brand_id: str) -> list[dict]:
+    """Return content schedule config (one row per platform) for a brand."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, brand_id, platform, posts_per_week, content_pillars,
+                   word_limit_step1, word_limit_subsequent, created_at
+            FROM brand_content_config
+            WHERE brand_id = $1
+            ORDER BY platform
+            """,
+            brand_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_brand_content_config(brand_id={brand_id}): {e}")
+        raise
+
+
+async def get_brand_care_config(pool: asyncpg.Pool, brand_id: str) -> Optional[dict]:
+    """Return at-risk keywords + escalation rules + retention offer for a brand, or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            SELECT id, brand_id, at_risk_keywords, escalation_triggers,
+                   retention_offer_template, created_at
+            FROM brand_care_config
+            WHERE brand_id = $1
+            """,
+            brand_id,
+        )
+        return dict(row) if row else None
+    except Exception as e:
+        print(f"[DB Error] get_brand_care_config(brand_id={brand_id}): {e}")
+        raise
+
+
+async def get_industry_benchmarks(pool: asyncpg.Pool, industry: str) -> list[dict]:
+    """Return ROI benchmarks for a given industry (all channels)."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, industry, channel, typical_roi_min, typical_roi_max, created_at
+            FROM industry_roi_benchmarks
+            WHERE industry = $1
+            ORDER BY channel
+            """,
+            industry,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_industry_benchmarks(industry={industry}): {e}")
+        raise
+
+
+async def log_client_agent_action(
+    pool: asyncpg.Pool,
+    client_id: str,
+    brand_id: Optional[str],
+    agent_name: str,
+    action_type: str,
+    summary: str,
+    data: dict,
+    status: str = "completed",
+    duration_ms: Optional[int] = None,
+) -> str:
+    """Write a row to client_agent_activity. Returns the new row UUID as a string."""
+    try:
+        log_id = await pool.fetchval(
+            """
+            INSERT INTO client_agent_activity
+                (client_id, brand_id, agent_name, action_type, summary, data, status, duration_ms, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, NOW())
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            agent_name,
+            action_type,
+            summary,
+            json.dumps(data),
+            status,
+            duration_ms,
+        )
+        return str(log_id)
+    except Exception as e:
+        print(f"[DB Error] log_client_agent_action(agent={agent_name}, type={action_type}): {e}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Phase 8: Orchestrator Agent — DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_approvals(pool: asyncpg.Pool, client_id: str) -> list[dict]:
+    """Return all status=pending approval requests for a client, oldest first."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, brand_id, agent_name, approval_type,
+                   payload, status, expires_at, decided_at, created_at
+            FROM client_approval_requests
+            WHERE client_id = $1
+              AND status = 'pending'
+            ORDER BY created_at ASC
+            """,
+            client_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_pending_approvals(client_id={client_id}): {e}")
+        raise
+
+
+async def save_approval_request(
+    pool: asyncpg.Pool,
+    client_id: str,
+    brand_id: Optional[str],
+    agent_name: str,
+    approval_type: str,
+    payload: dict,
+    expires_at=None,
+) -> str:
+    """Insert an approval request. Returns the new row UUID as a string."""
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO client_approval_requests
+                (client_id, brand_id, agent_name, approval_type, payload, expires_at)
+            VALUES ($1, $2, $3, $4, $5::jsonb, $6)
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            agent_name,
+            approval_type,
+            json.dumps(payload),
+            expires_at,
+        )
+        return str(row_id)
+    except Exception as e:
+        print(f"[DB Error] save_approval_request(client_id={client_id}, type={approval_type}): {e}")
+        raise
+
+
+async def update_approval_status(
+    pool: asyncpg.Pool, approval_id: str, status: str
+) -> None:
+    """Set status to approved/rejected/expired and record decided_at."""
+    try:
+        await pool.execute(
+            """
+            UPDATE client_approval_requests
+            SET status = $1, decided_at = NOW()
+            WHERE id = $2
+            """,
+            status,
+            approval_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_approval_status(approval_id={approval_id}): {e}")
+        raise
+
+
+async def get_roi_by_channel(
+    pool: asyncpg.Pool, client_id: str, days: int = 30
+) -> list[dict]:
+    """Compute rolling ROI per channel from spend + revenue tables.
+
+    Returns rows with: channel, total_spend, total_revenue, roi (revenue/spend).
+    Channels with zero spend are excluded. Sorted by roi DESC.
+    """
+    try:
+        rows = await pool.fetch(
+            """
+            WITH spend AS (
+                SELECT channel, SUM(amount) AS total_spend
+                FROM client_spend_entries
+                WHERE client_id = $1
+                  AND recorded_at >= NOW() - ($2 || ' days')::INTERVAL
+                GROUP BY channel
+            ),
+            revenue AS (
+                SELECT channel, SUM(amount) AS total_revenue
+                FROM client_revenue_entries
+                WHERE client_id = $1
+                  AND recorded_at >= NOW() - ($2 || ' days')::INTERVAL
+                GROUP BY channel
+            )
+            SELECT
+                s.channel,
+                s.total_spend,
+                COALESCE(r.total_revenue, 0) AS total_revenue,
+                CASE WHEN s.total_spend > 0
+                     THEN COALESCE(r.total_revenue, 0) / s.total_spend
+                     ELSE 0
+                END AS roi
+            FROM spend s
+            LEFT JOIN revenue r ON r.channel = s.channel
+            ORDER BY roi DESC
+            """,
+            client_id,
+            str(days),
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_roi_by_channel(client_id={client_id}): {e}")
+        return []
+
+
+async def get_budget_envelopes(pool: asyncpg.Pool, client_id: str) -> list[dict]:
+    """Return all channel budget envelopes for a client."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, channel, allocated_amount, spent_amount,
+                   roi_current, consecutive_below_roi_months, status, updated_at
+            FROM client_budget_envelopes
+            WHERE client_id = $1
+            ORDER BY channel
+            """,
+            client_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_budget_envelopes(client_id={client_id}): {e}")
+        return []
+
+
+async def save_roi_snapshot(
+    pool: asyncpg.Pool, client_id: str, snapshot_data: dict
+) -> str:
+    """Insert an ROI snapshot for today's 30-day rolling window. Returns new row UUID."""
+    from datetime import date, timedelta
+    period_end = date.today()
+    period_start = period_end - timedelta(days=30)
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO client_roi_snapshots (
+                client_id, period_start, period_end,
+                total_spend, total_revenue, platform_cost,
+                spend_by_channel, revenue_by_channel,
+                channels_below_target, compounding_channels
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::jsonb, $9::jsonb, $10::jsonb)
+            RETURNING id
+            """,
+            client_id,
+            period_start,
+            period_end,
+            snapshot_data.get("total_spend", 0.0),
+            snapshot_data.get("total_revenue", 0.0),
+            snapshot_data.get("platform_cost", 0.0),
+            json.dumps(snapshot_data.get("spend_by_channel", {})),
+            json.dumps(snapshot_data.get("revenue_by_channel", {})),
+            json.dumps(snapshot_data.get("channels_below_target", {})),
+            json.dumps(snapshot_data.get("compounding_channels", {})),
+        )
+        return str(row_id)
+    except Exception as e:
+        print(f"[DB Error] save_roi_snapshot(client_id={client_id}): {e}")
+        raise
+
+
+async def save_intelligence(
+    pool: asyncpg.Pool,
+    client_id: str,
+    report_type: str,
+    content: dict,
+    urgency: str = "normal",
+) -> str:
+    """Save a briefing or alert to client_intelligence. Returns new row UUID."""
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO client_intelligence (client_id, report_type, content, urgency)
+            VALUES ($1, $2, $3::jsonb, $4)
+            RETURNING id
+            """,
+            client_id,
+            report_type,
+            json.dumps(content),
+            urgency,
+        )
+        return str(row_id)
+    except Exception as e:
+        print(f"[DB Error] save_intelligence(client_id={client_id}, type={report_type}): {e}")
+        raise
+
+
+async def get_recent_intelligence(
+    pool: asyncpg.Pool, client_id: str, limit: int = 5
+) -> list[dict]:
+    """Return the most recent intelligence items for a client (for daily briefing)."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, report_type, content, urgency, created_at
+            FROM client_intelligence
+            WHERE client_id = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            client_id,
+            limit,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_recent_intelligence(client_id={client_id}): {e}")
+        return []
+
+
 async def get_monthly_roi_data(pool: asyncpg.Pool, restaurant_id: str) -> dict:
     """Compute monthly ROI metrics for the ROI summary email.
 
@@ -901,3 +1297,1121 @@ async def get_monthly_roi_data(pool: asyncpg.Pool, restaurant_id: str) -> dict:
             "estimated_hours_saved": 0.0,
             "food_cost_improvement_pct": None,
         }
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Scout Agent DB functions
+# ---------------------------------------------------------------------------
+
+async def get_unqualified_prospects(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, limit: int = 3
+) -> list[dict]:
+    """Return prospects with status='researched' (not yet scored) for a brand."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, brand_id, name, website, industry,
+                   size_signal, location, source, status, created_at
+            FROM client_prospects
+            WHERE client_id = $1
+              AND brand_id  = $2
+              AND status    = 'researched'
+            ORDER BY created_at ASC
+            LIMIT $3
+            """,
+            client_id,
+            brand_id,
+            limit,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_unqualified_prospects(client_id={client_id}): {e}")
+        return []
+
+
+async def save_prospect(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, prospect_data: dict
+) -> str:
+    """Insert a new prospect row. Returns the new UUID as a string."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_prospects
+                (client_id, brand_id, name, website, industry,
+                 size_signal, location, source, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'researched')
+            RETURNING id::TEXT
+            """,
+            client_id,
+            brand_id,
+            prospect_data.get("name", ""),
+            prospect_data.get("website"),
+            prospect_data.get("industry"),
+            prospect_data.get("size_signal"),
+            prospect_data.get("location"),
+            prospect_data.get("source", "manual"),
+        )
+        return row["id"] if row else ""
+    except Exception as e:
+        print(f"[DB Error] save_prospect(client_id={client_id}): {e}")
+        return ""
+
+
+async def update_prospect_score(
+    pool: asyncpg.Pool,
+    prospect_id: str,
+    score: float,
+    fit_signals: list,
+    roi_estimate: Optional[float] = None,
+    status: str = "qualified",
+) -> None:
+    """Update a prospect's qualification score, signals, ROI estimate, and status."""
+    try:
+        await pool.execute(
+            """
+            UPDATE client_prospects
+            SET qualification_score = $1,
+                fit_signals         = $2::JSONB,
+                roi_estimate        = $3,
+                status              = $4
+            WHERE id = $5
+            """,
+            score,
+            json.dumps(fit_signals),
+            roi_estimate,
+            status,
+            prospect_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_prospect_score(prospect_id={prospect_id}): {e}")
+
+
+async def save_lead(
+    pool: asyncpg.Pool,
+    client_id: str,
+    brand_id: str,
+    prospect_id: str,
+    stage: str = "pending_approval",
+    contract_value_estimate: Optional[float] = None,
+) -> str:
+    """Create a lead from a qualified prospect. Returns the new lead UUID."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_leads
+                (client_id, brand_id, prospect_id, stage, contract_value_estimate)
+            VALUES ($1, $2, $3, $4, $5)
+            RETURNING id::TEXT
+            """,
+            client_id,
+            brand_id,
+            prospect_id,
+            stage,
+            contract_value_estimate,
+        )
+        return row["id"] if row else ""
+    except Exception as e:
+        print(f"[DB Error] save_lead(prospect_id={prospect_id}): {e}")
+        return ""
+
+
+async def get_contracts_nearing_renewal(
+    pool: asyncpg.Pool, client_id: str, days: int = 90
+) -> list[dict]:
+    """Return active contracts with renewal_date within the next N days."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT c.id, c.client_id, c.brand_id, c.lead_id,
+                   c.value, c.renewal_date, c.status,
+                   p.name AS prospect_name
+            FROM client_contracts c
+            LEFT JOIN client_leads l ON l.id = c.lead_id
+            LEFT JOIN client_prospects p ON p.id = l.prospect_id
+            WHERE c.client_id   = $1
+              AND c.status      = 'active'
+              AND c.renewal_date IS NOT NULL
+              AND c.renewal_date BETWEEN CURRENT_DATE AND CURRENT_DATE + $2
+            ORDER BY c.renewal_date ASC
+            """,
+            client_id,
+            days,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_contracts_nearing_renewal(client_id={client_id}): {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Pipeline Agent DB functions
+# ---------------------------------------------------------------------------
+
+
+async def get_approved_leads(
+    pool: asyncpg.Pool, client_id: str, brand_id: str
+) -> list[dict]:
+    """Return leads with stage='identified' (approved by Orchestrator) that have
+    no existing outreach sequence yet."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT l.id, l.client_id, l.brand_id, l.prospect_id,
+                   l.stage, l.contract_value_estimate, l.created_at,
+                   p.name AS prospect_name, p.website, p.industry,
+                   p.size_signal, p.location, p.qualification_score,
+                   p.fit_signals, p.roi_estimate
+            FROM client_leads l
+            LEFT JOIN client_prospects p ON p.id = l.prospect_id
+            WHERE l.client_id = $1
+              AND l.brand_id  = $2
+              AND l.stage     = 'identified'
+              AND NOT EXISTS (
+                  SELECT 1 FROM client_outreach o
+                  WHERE o.lead_id = l.id
+              )
+            ORDER BY l.created_at ASC
+            """,
+            client_id,
+            brand_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_approved_leads(client_id={client_id}): {e}")
+        return []
+
+
+async def get_outreach_sequence(pool: asyncpg.Pool, lead_id: str) -> list[dict]:
+    """Return all outreach steps for a lead, ordered by step_number."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, lead_id, step_number, channel, subject, body,
+                   word_count, status, sequence_type, scheduled_for, sent_at, created_at
+            FROM client_outreach
+            WHERE lead_id = $1
+            ORDER BY step_number ASC
+            """,
+            lead_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_outreach_sequence(lead_id={lead_id}): {e}")
+        return []
+
+
+async def save_outreach_step(
+    pool: asyncpg.Pool,
+    client_id: str,
+    brand_id: str,
+    lead_id: str,
+    step_data: dict,
+) -> str:
+    """Insert one outreach sequence step. Returns new UUID as string.
+
+    step_data keys: step_number, sequence_type, channel, subject, body,
+                    word_count, status, scheduled_for (optional)
+    """
+    try:
+        row_id = await pool.fetchval(
+            """
+            INSERT INTO client_outreach
+                (client_id, brand_id, lead_id, sequence_type, step_number,
+                 channel, subject, body, word_count, status, scheduled_for)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            ON CONFLICT (lead_id, step_number) DO NOTHING
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            lead_id,
+            step_data.get("sequence_type", "new_acquisition"),
+            int(step_data["step_number"]),
+            step_data.get("channel", "email"),
+            step_data.get("subject"),
+            step_data["body"],
+            step_data.get("word_count"),
+            step_data.get("status", "draft"),
+            step_data.get("scheduled_for"),
+        )
+        return str(row_id) if row_id else ""
+    except Exception as e:
+        print(f"[DB Error] save_outreach_step(lead_id={lead_id}, step={step_data.get('step_number')}): {e}")
+        return ""
+
+
+async def get_due_outreach_steps(pool: asyncpg.Pool, client_id: str) -> list[dict]:
+    """Return approved outreach steps whose scheduled_for is in the past (due to send).
+
+    Joins to client_leads to include prospect context.
+    """
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT o.id, o.client_id, o.brand_id, o.lead_id, o.step_number,
+                   o.sequence_type, o.channel, o.subject, o.body,
+                   o.word_count, o.status, o.scheduled_for,
+                   l.stage AS lead_stage,
+                   p.name AS prospect_name
+            FROM client_outreach o
+            JOIN client_leads l ON l.id = o.lead_id
+            LEFT JOIN client_prospects p ON p.id = l.prospect_id
+            WHERE o.client_id   = $1
+              AND o.status      = 'approved'
+              AND (o.scheduled_for IS NULL OR o.scheduled_for <= NOW())
+            ORDER BY o.scheduled_for ASC NULLS FIRST
+            """,
+            client_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_due_outreach_steps(client_id={client_id}): {e}")
+        return []
+
+
+async def mark_outreach_sent(pool: asyncpg.Pool, outreach_id: str) -> None:
+    """Update an outreach step: status → sent, sent_at → now."""
+    try:
+        await pool.execute(
+            """
+            UPDATE client_outreach
+            SET status = 'sent', sent_at = NOW()
+            WHERE id = $1
+            """,
+            outreach_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] mark_outreach_sent(outreach_id={outreach_id}): {e}")
+        raise
+
+
+async def get_draft_steps_due_for_promotion(
+    pool: asyncpg.Pool, client_id: str
+) -> list[dict]:
+    """Return draft outreach steps whose scheduled_for <= now AND whose
+    previous step (step_number - 1) is 'sent'.
+
+    These are ready to be promoted to pending_approval.
+    """
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT o.id, o.client_id, o.brand_id, o.lead_id, o.step_number,
+                   o.sequence_type, o.channel, o.subject, o.body, o.word_count,
+                   o.scheduled_for, p.name AS prospect_name
+            FROM client_outreach o
+            LEFT JOIN client_leads l ON l.id = o.lead_id
+            LEFT JOIN client_prospects p ON p.id = l.prospect_id
+            WHERE o.client_id = $1
+              AND o.status    = 'draft'
+              AND (o.scheduled_for IS NULL OR o.scheduled_for <= NOW())
+              AND EXISTS (
+                  SELECT 1 FROM client_outreach prev
+                  WHERE prev.lead_id     = o.lead_id
+                    AND prev.step_number = o.step_number - 1
+                    AND prev.status      = 'sent'
+              )
+            ORDER BY o.scheduled_for ASC NULLS FIRST
+            """,
+            client_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_draft_steps_due_for_promotion(client_id={client_id}): {e}")
+        return []
+
+
+async def update_outreach_status(
+    pool: asyncpg.Pool, outreach_id: str, status: str
+) -> None:
+    """Set status on an outreach step (draft → pending_approval, etc.)."""
+    try:
+        await pool.execute(
+            "UPDATE client_outreach SET status = $1 WHERE id = $2",
+            status,
+            outreach_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_outreach_status(outreach_id={outreach_id}): {e}")
+        raise
+
+
+# =============================================================================
+# Phase 11: Customer Care Agent
+# =============================================================================
+
+
+async def get_new_feedback(
+    pool: asyncpg.Pool, client_id: str, brand_id: str
+) -> list[dict]:
+    """Return all unprocessed (status='new') feedback for a brand."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, brand_id, channel, text, status, created_at
+            FROM client_feedback
+            WHERE client_id = $1
+              AND brand_id  = $2
+              AND status    = 'new'
+            ORDER BY created_at ASC
+            """,
+            client_id,
+            brand_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_new_feedback(client_id={client_id}): {e}")
+        return []
+
+
+async def save_feedback_classification(
+    pool: asyncpg.Pool, feedback_id: str, classification_data: dict
+) -> None:
+    """Update a feedback row with classification results and response draft.
+
+    classification_data keys: feedback_type, urgency, sentiment_score,
+    is_at_risk_flag, response_draft, status (defaults to 'pending_approval').
+    """
+    try:
+        await pool.execute(
+            """
+            UPDATE client_feedback
+            SET feedback_type   = $1,
+                urgency         = $2,
+                sentiment_score = $3,
+                is_at_risk_flag = $4,
+                response_draft  = $5,
+                status          = $6
+            WHERE id = $7
+            """,
+            classification_data.get("feedback_type"),
+            classification_data.get("urgency", "normal"),
+            classification_data.get("sentiment_score"),
+            bool(classification_data.get("is_at_risk_flag", False)),
+            classification_data.get("response_draft"),
+            classification_data.get("status", "pending_approval"),
+            feedback_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] save_feedback_classification(feedback_id={feedback_id}): {e}")
+        raise
+
+
+async def save_testimonial(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, feedback_id: str, quote: str
+) -> str | None:
+    """Insert a pending-permission testimonial row. Returns new id or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_testimonials
+                (client_id, brand_id, feedback_id, quote_original, status)
+            VALUES ($1, $2, $3, $4, 'pending_permission')
+            ON CONFLICT DO NOTHING
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            feedback_id,
+            quote,
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_testimonial(feedback_id={feedback_id}): {e}")
+        return None
+
+
+async def get_competitors(
+    pool: asyncpg.Pool, client_id: str, brand_id: str
+) -> list[dict]:
+    """Return all active competitors for a brand."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, brand_id, name, website_url,
+                   instagram_handle, google_maps_place_id
+            FROM client_competitors
+            WHERE client_id = $1
+              AND brand_id  = $2
+              AND is_active = TRUE
+            ORDER BY name
+            """,
+            client_id,
+            brand_id,
+        )
+        return [dict(row) for row in rows]
+    except Exception as e:
+        print(f"[DB Error] get_competitors(client_id={client_id}): {e}")
+        return []
+
+
+async def save_competitor_snapshot(
+    pool: asyncpg.Pool,
+    client_id: str,
+    competitor_id: str,
+    snapshot_data: dict,
+) -> None:
+    """Upsert a monthly competitor snapshot (unique on competitor_id + snapshot_month)."""
+    import json as _json
+    try:
+        await pool.execute(
+            """
+            INSERT INTO client_competitor_snapshots
+                (client_id, competitor_id, snapshot_month, website_summary,
+                 google_rating, google_reviews_sample, instagram_data,
+                 actual_strengths, actual_weaknesses, positioning_summary)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (competitor_id, snapshot_month)
+            DO UPDATE SET
+                website_summary       = EXCLUDED.website_summary,
+                google_rating         = EXCLUDED.google_rating,
+                google_reviews_sample = EXCLUDED.google_reviews_sample,
+                instagram_data        = EXCLUDED.instagram_data,
+                actual_strengths      = EXCLUDED.actual_strengths,
+                actual_weaknesses     = EXCLUDED.actual_weaknesses,
+                positioning_summary   = EXCLUDED.positioning_summary
+            """,
+            client_id,
+            competitor_id,
+            snapshot_data.get("snapshot_month"),
+            snapshot_data.get("website_summary"),
+            snapshot_data.get("google_rating"),
+            _json.dumps(snapshot_data.get("google_reviews_sample") or []),
+            _json.dumps(snapshot_data.get("instagram_data") or {}),
+            snapshot_data.get("actual_strengths") or [],
+            snapshot_data.get("actual_weaknesses") or [],
+            snapshot_data.get("positioning_summary"),
+        )
+    except Exception as e:
+        print(f"[DB Error] save_competitor_snapshot(competitor_id={competitor_id}): {e}")
+        raise
+
+
+async def save_strategic_report(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, report_data: dict
+) -> str | None:
+    """Insert a strategic report (status=pending_approval). Returns new id or None."""
+    import json as _json
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_strategic_reports
+                (client_id, brand_id, competitors_analysed, landscape_summary,
+                 universal_complaints, unserved_needs, opportunities,
+                 executive_summary, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending_approval')
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            int(report_data.get("competitors_analysed", 0)),
+            report_data.get("landscape_summary"),
+            report_data.get("universal_complaints") or [],
+            report_data.get("unserved_needs") or [],
+            _json.dumps(report_data.get("opportunities") or []),
+            report_data.get("executive_summary"),
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_strategic_report(client_id={client_id}): {e}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: Broadcast Agent — social posts + comments
+# ---------------------------------------------------------------------------
+
+async def save_social_post(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, post_data: dict
+) -> str | None:
+    """Insert a draft social post (status=pending_approval). Returns new id or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_social_posts
+                (client_id, brand_id, platform, post_type, content_pillar,
+                 caption, caption_secondary_language, visual_brief, hashtags,
+                 status, scheduled_for)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending_approval', $10)
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            post_data.get("platform"),
+            post_data.get("post_type"),
+            post_data.get("content_pillar"),
+            post_data.get("caption"),
+            post_data.get("caption_secondary_language"),
+            post_data.get("visual_brief"),
+            post_data.get("hashtags") or [],
+            post_data.get("scheduled_for"),
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_social_post(client_id={client_id}): {e}")
+        return None
+
+
+async def get_approved_posts(pool: asyncpg.Pool, client_id: str) -> list[dict]:
+    """Return approved posts with scheduled_for <= now (ready to publish)."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, client_id, brand_id, platform, caption,
+                   caption_secondary_language, hashtags, scheduled_for
+            FROM client_social_posts
+            WHERE client_id = $1
+              AND status = 'approved'
+              AND scheduled_for <= NOW()
+            ORDER BY scheduled_for ASC
+            """,
+            client_id,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_approved_posts(client_id={client_id}): {e}")
+        return []
+
+
+async def update_post_status(
+    pool: asyncpg.Pool, post_id: str, status: str
+) -> None:
+    """Update the status of a social post (e.g. 'published' or 'failed')."""
+    try:
+        published_at_clause = ", published_at = NOW()" if status == "published" else ""
+        await pool.execute(
+            f"UPDATE client_social_posts SET status = $1{published_at_clause} WHERE id = $2",
+            status,
+            post_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_post_status(post_id={post_id}): {e}")
+
+
+async def update_post_engagement(
+    pool: asyncpg.Pool, post_id: str, metrics: dict
+) -> None:
+    """Update engagement counters on a published post."""
+    try:
+        await pool.execute(
+            """
+            UPDATE client_social_posts
+            SET likes_count          = $1,
+                comments_count       = $2,
+                reach                = $3,
+                impressions          = $4,
+                engagement_rate      = $5,
+                last_engagement_sync = NOW()
+            WHERE id = $6
+            """,
+            int(metrics.get("likes_count", 0)),
+            int(metrics.get("comments_count", 0)),
+            int(metrics.get("reach", 0)),
+            int(metrics.get("impressions", 0)),
+            float(metrics.get("engagement_rate", 0.0)),
+            post_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_post_engagement(post_id={post_id}): {e}")
+
+
+async def get_recent_comments(
+    pool: asyncpg.Pool, client_id: str, brand_id: str, since_iso: str
+) -> list[dict]:
+    """Return unprocessed (new) social comments since the given ISO timestamp."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, post_id, platform_comment_id, text, created_at
+            FROM client_social_comments
+            WHERE client_id = $1
+              AND brand_id  = $2
+              AND status    = 'pending_approval'
+              AND created_at >= $3::timestamptz
+            ORDER BY created_at ASC
+            """,
+            client_id,
+            brand_id,
+            since_iso,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_recent_comments(client_id={client_id}): {e}")
+        return []
+
+
+async def save_comment_classification(
+    pool: asyncpg.Pool, comment_id: str, classification_data: dict
+) -> None:
+    """Save sentiment, reply draft, and escalation info on a social comment."""
+    try:
+        await pool.execute(
+            """
+            UPDATE client_social_comments
+            SET sentiment         = $1,
+                requires_reply    = $2,
+                reply_draft       = $3,
+                status            = $4,
+                escalation_reason = $5
+            WHERE id = $6
+            """,
+            classification_data.get("sentiment"),
+            bool(classification_data.get("requires_reply", False)),
+            classification_data.get("reply_draft"),
+            "escalated" if classification_data.get("escalate_to_human") else "pending_approval",
+            classification_data.get("escalation_reason"),
+            comment_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] save_comment_classification(comment_id={comment_id}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 13: SEO Engine Agent — DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_priority_keywords(
+    pool: asyncpg.Pool, brand_id: str, limit: int = 4
+) -> list[dict]:
+    """Return keywords with status='identified', ordered by is_priority DESC."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, brand_id, keyword, intent, cluster_topic, is_priority, status
+            FROM brand_keywords
+            WHERE brand_id = $1
+              AND status   = 'identified'
+            ORDER BY is_priority DESC, created_at ASC
+            LIMIT $2
+            """,
+            brand_id,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_priority_keywords(brand_id={brand_id}): {e}")
+        return []
+
+
+async def get_published_slugs(
+    pool: asyncpg.Pool, client_id: str, brand_id: str
+) -> list[str]:
+    """Return slugs of all published (or approved) SEO articles to prevent duplication."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT slug
+            FROM client_seo_content
+            WHERE client_id = $1
+              AND brand_id  = $2
+              AND status    IN ('approved', 'published')
+            """,
+            client_id,
+            brand_id,
+        )
+        return [r["slug"] for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_published_slugs(client_id={client_id}): {e}")
+        return []
+
+
+async def save_seo_article(
+    pool: asyncpg.Pool,
+    client_id: str,
+    brand_id: str,
+    keyword_id: Optional[str],
+    article_data: dict,
+) -> str | None:
+    """Insert an SEO article as pending_approval. Returns new UUID or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO client_seo_content
+                (client_id, brand_id, keyword_id, title, slug, content_markdown,
+                 meta_title, meta_description, schema_markup,
+                 word_count, seo_score, status)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, 'pending_approval')
+            ON CONFLICT (client_id, brand_id, slug) DO NOTHING
+            RETURNING id
+            """,
+            client_id,
+            brand_id,
+            keyword_id,
+            article_data.get("title"),
+            article_data.get("slug"),
+            article_data.get("content_markdown"),
+            article_data.get("meta_title"),
+            article_data.get("meta_description"),
+            json.dumps(article_data.get("schema_markup") or {}),
+            article_data.get("word_count"),
+            article_data.get("seo_score"),
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_seo_article(client_id={client_id}, slug={article_data.get('slug')}): {e}")
+        return None
+
+
+async def update_keyword_status(
+    pool: asyncpg.Pool, keyword_id: str, status: str
+) -> None:
+    """Update a brand_keyword row's status (identified → in_progress → published)."""
+    try:
+        await pool.execute(
+            "UPDATE brand_keywords SET status = $1 WHERE id = $2",
+            status,
+            keyword_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_keyword_status(keyword_id={keyword_id}): {e}")
+
+
+async def save_keyword_cluster(
+    pool: asyncpg.Pool, brand_id: str, keywords: list[dict]
+) -> int:
+    """Insert new keyword cluster rows, skipping duplicates. Returns count inserted."""
+    inserted = 0
+    for kw in keywords:
+        try:
+            result = await pool.execute(
+                """
+                INSERT INTO brand_keywords
+                    (brand_id, keyword, intent, cluster_topic, is_priority, status)
+                VALUES ($1, $2, $3, $4, $5, 'identified')
+                ON CONFLICT DO NOTHING
+                """,
+                brand_id,
+                kw.get("keyword"),
+                kw.get("intent"),
+                kw.get("cluster_topic"),
+                bool(kw.get("is_priority", False)),
+            )
+            if result and result != "INSERT 0 0":
+                inserted += 1
+        except Exception as e:
+            print(f"[DB Error] save_keyword_cluster(brand_id={brand_id}, kw={kw.get('keyword')}): {e}")
+    return inserted
+
+
+# ---------------------------------------------------------------------------
+# Phase 14A: Sales Outreach Agent — DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_new_company_leads(
+    pool: asyncpg.Pool, limit: int = 30
+) -> list[dict]:
+    """Return company leads with status='new' that have not yet been emailed."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, apollo_id, company_name, owner_name, owner_email,
+                   phone, website, location, employee_count, industry,
+                   pain_points, qualification_score, fit_signals, source
+            FROM company_leads
+            WHERE status = 'new'
+              AND owner_email IS NOT NULL
+            ORDER BY qualification_score DESC, created_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_new_company_leads: {e}")
+        return []
+
+
+async def save_company_lead(
+    pool: asyncpg.Pool, lead_data: dict
+) -> Optional[str]:
+    """Upsert a company lead from Apollo.io. Returns UUID or None on conflict."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO company_leads
+                (apollo_id, company_name, owner_name, owner_email, phone,
+                 website, location, employee_count, industry, source)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+            ON CONFLICT (apollo_id) DO NOTHING
+            RETURNING id
+            """,
+            lead_data.get("apollo_id"),
+            lead_data.get("company_name"),
+            lead_data.get("owner_name"),
+            lead_data.get("owner_email"),
+            lead_data.get("phone"),
+            lead_data.get("website"),
+            lead_data.get("location"),
+            lead_data.get("employee_count"),
+            lead_data.get("industry"),
+            lead_data.get("source", "apollo"),
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_company_lead(company={lead_data.get('company_name')}): {e}")
+        return None
+
+
+async def update_company_lead_score(
+    pool: asyncpg.Pool,
+    lead_id: str,
+    score: float,
+    fit_signals: dict,
+    pain_points: list[str],
+) -> None:
+    """Update qualification score and signals on a company lead."""
+    try:
+        await pool.execute(
+            """
+            UPDATE company_leads
+            SET qualification_score = $1,
+                fit_signals          = $2::jsonb,
+                pain_points          = $3
+            WHERE id = $4
+            """,
+            score,
+            json.dumps(fit_signals),
+            pain_points,
+            lead_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_company_lead_score(lead_id={lead_id}): {e}")
+
+
+async def save_outreach_draft(
+    pool: asyncpg.Pool,
+    lead_id: str,
+    sequence_step: int,
+    subject: str,
+    body: str,
+    scheduled_for,
+) -> Optional[str]:
+    """Save a cold email draft for a company lead. Returns UUID or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO company_outreach
+                (lead_id, sequence_step, subject, body, status, scheduled_for)
+            VALUES ($1, $2, $3, $4, 'approved', $5)
+            ON CONFLICT (lead_id, sequence_step) DO NOTHING
+            RETURNING id
+            """,
+            lead_id,
+            sequence_step,
+            subject,
+            body,
+            scheduled_for,
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_outreach_draft(lead_id={lead_id}): {e}")
+        return None
+
+
+async def get_approved_outreach_batch(
+    pool: asyncpg.Pool, limit: int = 20
+) -> list[dict]:
+    """Return approved outreach steps with scheduled_for <= now, up to batch limit."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT o.id, o.lead_id, o.sequence_step, o.subject, o.body,
+                   l.owner_name, l.owner_email, l.company_name
+            FROM company_outreach o
+            JOIN company_leads l ON l.id = o.lead_id
+            WHERE o.status = 'approved'
+              AND o.scheduled_for <= NOW()
+              AND l.status NOT IN ('unsubscribed', 'lost')
+              AND l.owner_email IS NOT NULL
+            ORDER BY o.scheduled_for ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_approved_outreach_batch: {e}")
+        return []
+
+
+async def mark_company_outreach_sent(
+    pool: asyncpg.Pool, outreach_id: str, resend_email_id: str
+) -> None:
+    """Mark a company outreach step as sent and record the Resend email ID."""
+    try:
+        await pool.execute(
+            """
+            UPDATE company_outreach
+            SET status          = 'sent',
+                sent_at         = NOW(),
+                resend_email_id = $2
+            WHERE id = $1
+            """,
+            outreach_id,
+            resend_email_id,
+        )
+        # Also update the lead's last_contacted_at
+        await pool.execute(
+            """
+            UPDATE company_leads
+            SET last_contacted_at = NOW(),
+                status            = CASE WHEN status = 'new' THEN 'emailed' ELSE status END
+            WHERE id = (SELECT lead_id FROM company_outreach WHERE id = $1)
+            """,
+            outreach_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] mark_company_outreach_sent(outreach_id={outreach_id}): {e}")
+
+
+async def record_email_engagement(
+    pool: asyncpg.Pool, resend_email_id: str, event: str
+) -> None:
+    """Record an open or click event on a company outreach email (from Resend webhook).
+
+    event: 'open' | 'click'
+    """
+    try:
+        if event == "open":
+            await pool.execute(
+                """
+                UPDATE company_outreach SET opened_at = NOW() WHERE resend_email_id = $1
+                """,
+                resend_email_id,
+            )
+            await pool.execute(
+                """
+                UPDATE company_leads SET email_opens = email_opens + 1
+                WHERE id = (SELECT lead_id FROM company_outreach WHERE resend_email_id = $1)
+                """,
+                resend_email_id,
+            )
+        elif event == "click":
+            await pool.execute(
+                """
+                UPDATE company_outreach SET clicked_at = NOW() WHERE resend_email_id = $1
+                """,
+                resend_email_id,
+            )
+            await pool.execute(
+                """
+                UPDATE company_leads SET email_clicks = email_clicks + 1
+                WHERE id = (SELECT lead_id FROM company_outreach WHERE resend_email_id = $1)
+                """,
+                resend_email_id,
+            )
+    except Exception as e:
+        print(f"[DB Error] record_email_engagement(resend_id={resend_email_id}, event={event}): {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 14B: Marketing Content Agent — DB helpers
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_marketing_keywords(
+    pool: asyncpg.Pool, limit: int = 3
+) -> list[dict]:
+    """Return company marketing keywords with status='identified', priority first."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT id, keyword, intent, cluster_topic, is_priority, status
+            FROM company_marketing_keywords
+            WHERE status = 'identified'
+            ORDER BY is_priority DESC, created_at ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_pending_marketing_keywords: {e}")
+        return []
+
+
+async def get_published_blog_slugs(pool: asyncpg.Pool) -> list[str]:
+    """Return slugs of all approved or published blog posts (to avoid duplication)."""
+    try:
+        rows = await pool.fetch(
+            """
+            SELECT slug
+            FROM company_blog_posts
+            WHERE status IN ('approved', 'published', 'pending_approval')
+            """
+        )
+        return [r["slug"] for r in rows]
+    except Exception as e:
+        print(f"[DB Error] get_published_blog_slugs: {e}")
+        return []
+
+
+async def save_blog_post(
+    pool: asyncpg.Pool, keyword_id: Optional[str], post_data: dict
+) -> Optional[str]:
+    """Insert a generated blog post as pending_approval. Returns UUID or None."""
+    try:
+        row = await pool.fetchrow(
+            """
+            INSERT INTO company_blog_posts
+                (keyword_id, title, slug, content_markdown,
+                 meta_title, meta_description, word_count, seo_score)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            ON CONFLICT (slug) DO NOTHING
+            RETURNING id
+            """,
+            keyword_id,
+            post_data.get("title"),
+            post_data.get("slug"),
+            post_data.get("content_markdown"),
+            post_data.get("meta_title"),
+            post_data.get("meta_description"),
+            post_data.get("word_count"),
+            post_data.get("seo_score"),
+        )
+        return str(row["id"]) if row else None
+    except Exception as e:
+        print(f"[DB Error] save_blog_post(slug={post_data.get('slug')}): {e}")
+        return None
+
+
+async def update_marketing_keyword_status(
+    pool: asyncpg.Pool, keyword_id: str, status: str
+) -> None:
+    """Update a company_marketing_keywords status (identified → in_progress → published)."""
+    try:
+        await pool.execute(
+            "UPDATE company_marketing_keywords SET status = $1 WHERE id = $2",
+            status,
+            keyword_id,
+        )
+    except Exception as e:
+        print(f"[DB Error] update_marketing_keyword_status(keyword_id={keyword_id}): {e}")
+
+
+async def save_marketing_keyword_cluster(
+    pool: asyncpg.Pool, keywords: list[dict]
+) -> int:
+    """Insert new company marketing keywords, skipping duplicates. Returns count inserted."""
+    inserted = 0
+    for kw in keywords:
+        try:
+            result = await pool.execute(
+                """
+                INSERT INTO company_marketing_keywords
+                    (keyword, intent, cluster_topic, is_priority, status)
+                VALUES ($1, $2, $3, $4, 'identified')
+                ON CONFLICT (keyword) DO NOTHING
+                """,
+                kw.get("keyword"),
+                kw.get("intent"),
+                kw.get("cluster_topic"),
+                bool(kw.get("is_priority", False)),
+            )
+            if result and result != "INSERT 0 0":
+                inserted += 1
+        except Exception as e:
+            print(f"[DB Error] save_marketing_keyword_cluster(kw={kw.get('keyword')}): {e}")
+    return inserted

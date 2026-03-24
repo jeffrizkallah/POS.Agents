@@ -11,7 +11,7 @@ from datetime import date
 
 from tools.metrics.revenue_metrics import get_revenue_metrics, get_revenue_by_category
 from tools.metrics.food_cost_metrics import get_food_cost_metrics, get_dish_performance
-from tools.metrics.inventory_metrics import get_inventory_metrics, get_waste_by_ingredient
+from tools.metrics.inventory_metrics import get_inventory_metrics, get_waste_by_ingredient, get_consumption_analysis
 from tools.metrics.menu_metrics import get_menu_metrics, get_full_menu_performance
 from tools.metrics.ops_metrics import get_ops_metrics
 from tools.anomaly_detector import detect_anomalies
@@ -49,6 +49,7 @@ async def build_report_package(
             dish_performance,
             waste_by_ingredient,
             full_menu,
+            consumption,
         ) = await asyncio.gather(
             get_revenue_metrics(pool, restaurant_id, week_start, week_end),
             get_food_cost_metrics(pool, restaurant_id, week_start, week_end),
@@ -59,6 +60,7 @@ async def build_report_package(
             get_dish_performance(pool, restaurant_id, week_start, week_end),
             get_waste_by_ingredient(pool, restaurant_id, week_start, week_end),
             get_full_menu_performance(pool, restaurant_id, week_start, week_end),
+            get_consumption_analysis(pool, restaurant_id, week_start, week_end),
         )
 
         # --- Step 2: Fetch benchmarks ---
@@ -110,6 +112,7 @@ async def build_report_package(
             "dish_performance": dish_performance,
             "waste_by_ingredient": waste_by_ingredient,
             "full_menu_performance": full_menu,
+            "consumption": consumption,
             "benchmarks": benchmarks,
             "benchmark_comparisons": benchmark_comparisons,
             "anomalies": anomalies,

@@ -11,7 +11,13 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from tools.database import create_pool, get_all_restaurants, get_manager_email
+from tools.database import (
+    create_pool,
+    get_all_restaurants,
+    get_manager_email,
+    get_all_clients,
+    get_brands_for_client,
+)
 from agents.inventory import run_inventory_check, detect_waste_anomalies
 from agents.ordering import draft_purchase_orders, send_approval_email
 from agents.pricing import (
@@ -25,6 +31,14 @@ from agents.customer_success import (
     send_monthly_roi_summary_email,
 )
 from agents.reporting import run_reporting_agent
+from agents.orchestrator import run_orchestrator, run_daily_briefing
+from agents.scout import run_scout
+from agents.pipeline import run_pipeline
+from agents.customer_care import run_care_feedback, run_competitive_intel
+from agents.broadcast import run_content_batch, run_publish_queue, run_engagement_sync
+from agents.seo_engine import run_seo_engine
+from agents.sales import run_apollo_pull, run_sales_batch
+from agents.marketing import run_marketing_content, run_marketing_publish
 from tools.email_sender import send_urgent_alert
 
 # Global pool — created once at startup, reused by every job
@@ -61,6 +75,29 @@ def start_health_server():
     thread = Thread(target=server.serve_forever, daemon=True)
     thread.start()
     print("[Health] Health check server started on port 8080")
+
+
+# ---------------------------------------------------------------------------
+# Phase 7C: Multi-client loop pattern — reused by all Phase 8-13 agents
+# ---------------------------------------------------------------------------
+
+async def _async_client_agent_job(agent_fn) -> None:
+    """Generic multi-client loop. Iterates all active clients → brands and
+    calls agent_fn(pool, client, brand) for each combination.
+
+    One failing brand never stops others. Reused by every Phase 8-13 agent:
+        scheduler.add_job(lambda: _run(_async_client_agent_job(my_agent_fn)), ...)
+    """
+    global pool
+    clients = await get_all_clients(pool)
+    print(f"[MultiClient] {agent_fn.__name__} — {len(clients)} client(s)")
+    for client in clients:
+        brands = await get_brands_for_client(pool, str(client["id"]))
+        for brand in brands:
+            try:
+                await agent_fn(pool, client, brand)
+            except Exception as e:
+                print(f"[MultiClient] {agent_fn.__name__} failed for brand '{brand['name']}': {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +348,150 @@ def reporting_job():
 
 
 # ---------------------------------------------------------------------------
+# Phase 8: Orchestrator jobs (every 4 hours + weekday 07:30 briefing)
+# ---------------------------------------------------------------------------
+
+def orchestrator_job():
+    """Sync wrapper: approval routing + ROI classification for all clients/brands."""
+    try:
+        _run(_async_client_agent_job(run_orchestrator))
+    except Exception as e:
+        print(f"[Scheduler Error] orchestrator_job crashed: {e}")
+
+
+def daily_briefing_job():
+    """Sync wrapper: daily briefing email for all clients/brands (weekdays 07:30)."""
+    try:
+        _run(_async_client_agent_job(run_daily_briefing))
+    except Exception as e:
+        print(f"[Scheduler Error] daily_briefing_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 9: Scout job (weekdays 07:00 — qualify prospects + flag renewals)
+# ---------------------------------------------------------------------------
+
+def scout_job():
+    """Sync wrapper: prospect qualification for all clients/brands (weekdays 07:00)."""
+    try:
+        _run(_async_client_agent_job(run_scout))
+    except Exception as e:
+        print(f"[Scheduler Error] scout_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 10: Pipeline job (weekdays 09:00 — outreach sequencing + step execution)
+# ---------------------------------------------------------------------------
+
+def pipeline_job():
+    """Sync wrapper: generate outreach sequences and execute approved steps."""
+    try:
+        _run(_async_client_agent_job(run_pipeline))
+    except Exception as e:
+        print(f"[Scheduler Error] pipeline_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 11: Customer Care jobs
+# ---------------------------------------------------------------------------
+
+def care_feedback_job():
+    """Sync wrapper: feedback triage for all clients/brands (every 30 min)."""
+    try:
+        _run(_async_client_agent_job(run_care_feedback))
+    except Exception as e:
+        print(f"[Scheduler Error] care_feedback_job crashed: {e}")
+
+
+def care_intel_job():
+    """Sync wrapper: monthly competitive intelligence (1st of month at 06:00)."""
+    try:
+        _run(_async_client_agent_job(run_competitive_intel))
+    except Exception as e:
+        print(f"[Scheduler Error] care_intel_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 12: Broadcast Agent jobs
+# ---------------------------------------------------------------------------
+
+def broadcast_batch_job():
+    """Sync wrapper: generate weekly social posts for all clients/brands (Monday 06:00)."""
+    try:
+        _run(_async_client_agent_job(run_content_batch))
+    except Exception as e:
+        print(f"[Scheduler Error] broadcast_batch_job crashed: {e}")
+
+
+def broadcast_publish_job():
+    """Sync wrapper: publish approved posts with scheduled_for <= now (every 30 min)."""
+    try:
+        _run(_async_client_agent_job(run_publish_queue))
+    except Exception as e:
+        print(f"[Scheduler Error] broadcast_publish_job crashed: {e}")
+
+
+def broadcast_engagement_job():
+    """Sync wrapper: sync engagement metrics and classify new comments (every 2 hours)."""
+    try:
+        _run(_async_client_agent_job(run_engagement_sync))
+    except Exception as e:
+        print(f"[Scheduler Error] broadcast_engagement_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 13: SEO Engine job (Monday 06:00 — alongside broadcast batch)
+# ---------------------------------------------------------------------------
+
+def seo_engine_job():
+    """Sync wrapper: generate SEO keyword clusters and articles for all clients/brands."""
+    try:
+        _run(_async_client_agent_job(run_seo_engine))
+    except Exception as e:
+        print(f"[Scheduler Error] seo_engine_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 14A: Sales Outreach jobs
+# ---------------------------------------------------------------------------
+
+def sales_apollo_job():
+    """Sync wrapper: weekly Apollo.io lead pull + scoring + cold email drafting (Monday 08:00)."""
+    try:
+        _run(run_apollo_pull(pool))
+    except Exception as e:
+        print(f"[Scheduler Error] sales_apollo_job crashed: {e}")
+
+
+def sales_batch_job():
+    """Sync wrapper: daily cold email batch send — up to 20 emails (weekdays 10:00)."""
+    try:
+        _run(run_sales_batch(pool))
+    except Exception as e:
+        print(f"[Scheduler Error] sales_batch_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 14B: Marketing Content jobs
+# ---------------------------------------------------------------------------
+
+def marketing_content_job():
+    """Sync wrapper: weekly blog post generation (Monday 07:00)."""
+    try:
+        _run(run_marketing_content(pool))
+    except Exception as e:
+        print(f"[Scheduler Error] marketing_content_job crashed: {e}")
+
+
+def marketing_publish_job():
+    """Sync wrapper: daily Buffer publish of approved blog posts (weekdays 10:30)."""
+    try:
+        _run(run_marketing_publish(pool))
+    except Exception as e:
+        print(f"[Scheduler Error] marketing_publish_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 
@@ -402,6 +583,134 @@ def main():
         name="Weekly Reporting & Analytics",
         max_instances=1,
         misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        orchestrator_job,
+        CronTrigger(hour="*/4"),
+        id="orchestrator",
+        name="Orchestrator — Approval Routing & ROI Classification",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        daily_briefing_job,
+        CronTrigger(day_of_week="mon-fri", hour=7, minute=30),
+        id="daily_briefing",
+        name="Daily Briefing Email",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        scout_job,
+        CronTrigger(day_of_week="mon-fri", hour=7, minute=0),
+        id="scout",
+        name="Scout — Prospect Qualification & Renewal Alerts",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        pipeline_job,
+        CronTrigger(day_of_week="mon-fri", hour=9, minute=0),
+        id="pipeline",
+        name="Pipeline — Outreach Sequencing & Step Execution",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        care_feedback_job,
+        CronTrigger(minute="*/30"),
+        id="care_feedback",
+        name="Customer Care — Feedback Triage",
+        max_instances=1,
+        misfire_grace_time=120,
+    )
+
+    scheduler.add_job(
+        care_intel_job,
+        CronTrigger(day=1, hour=6, minute=0),
+        id="care_intel",
+        name="Customer Care — Monthly Competitive Intelligence",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        broadcast_batch_job,
+        CronTrigger(day_of_week="mon", hour=6, minute=0),
+        id="broadcast_batch",
+        name="Broadcast — Weekly Content Generation",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        broadcast_publish_job,
+        CronTrigger(minute="*/30"),
+        id="broadcast_publish",
+        name="Broadcast — Publish Approved Posts",
+        max_instances=1,
+        misfire_grace_time=120,
+    )
+
+    scheduler.add_job(
+        broadcast_engagement_job,
+        CronTrigger(hour="*/2"),
+        id="broadcast_engagement",
+        name="Broadcast — Engagement Sync & Comment Classification",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    scheduler.add_job(
+        seo_engine_job,
+        CronTrigger(day_of_week="mon", hour=6, minute=0),
+        id="seo_engine",
+        name="SEO Engine — Keyword Clusters & Article Generation",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    # Phase 14A: Sales Outreach
+    scheduler.add_job(
+        sales_apollo_job,
+        CronTrigger(day_of_week="mon", hour=8, minute=0),
+        id="sales_apollo",
+        name="Sales — Weekly Apollo Lead Pull & Cold Email Drafting",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        sales_batch_job,
+        CronTrigger(day_of_week="mon-fri", hour=10, minute=0),
+        id="sales_batch",
+        name="Sales — Daily Cold Email Batch Send (max 20/day)",
+        max_instances=1,
+        misfire_grace_time=300,
+    )
+
+    # Phase 14B: Marketing Content
+    scheduler.add_job(
+        marketing_content_job,
+        CronTrigger(day_of_week="mon", hour=7, minute=0),
+        id="marketing_content",
+        name="Marketing — Weekly Blog Post Generation",
+        max_instances=1,
+        misfire_grace_time=3600,
+    )
+
+    scheduler.add_job(
+        marketing_publish_job,
+        CronTrigger(day_of_week="mon-fri", hour=10, minute=30),
+        id="marketing_publish",
+        name="Marketing — Publish Approved Blog Posts via Buffer",
+        max_instances=1,
+        misfire_grace_time=300,
     )
 
     scheduler.start()

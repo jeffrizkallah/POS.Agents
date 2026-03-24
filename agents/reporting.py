@@ -46,7 +46,7 @@ async def run_reporting_agent(pool: asyncpg.Pool) -> None:
     week_start = week_end - timedelta(days=6)
 
     print(
-        f"[Reporting] Starting weekly run for {week_start} → {week_end}"
+        f"[Reporting] Starting weekly run for {week_start} to {week_end}"
     )
 
     dashboard_url = os.environ.get("APP_URL", "https://app.restaurantos.com")
@@ -90,14 +90,17 @@ async def run_reporting_agent(pool: asyncpg.Pool) -> None:
             if not manager_email:
                 print(f"[Reporting] No email found for {restaurant_name} — skipping send")
             else:
-                await send_analytics_report(
-                    to_email=manager_email,
-                    restaurant_name=restaurant_name,
-                    report_package=package,
-                    narrative=narrative,
-                    dashboard_url=dashboard_url,
-                )
-                reports_sent += 1
+                try:
+                    await send_analytics_report(
+                        to_email=manager_email,
+                        restaurant_name=restaurant_name,
+                        report_package=package,
+                        narrative=narrative,
+                        dashboard_url=dashboard_url,
+                    )
+                    reports_sent += 1
+                except Exception as email_err:
+                    print(f"[Reporting] Email failed for {restaurant_name}: {email_err}")
 
             # Mark snapshot as report_sent
             await mark_report_sent(pool, restaurant_id, week_start)
@@ -167,15 +170,18 @@ async def run_reporting_agent(pool: asyncpg.Pool) -> None:
         # Send to platform report email
         platform_email = os.environ.get("PLATFORM_REPORT_EMAIL")
         if platform_email and platform_narrative:
-            await send_platform_intelligence(
-                to_email=platform_email,
-                platform_narrative=platform_narrative,
-                platform_metrics=platform_metrics,
-                league_table=league_table,
-                week_start=week_start.isoformat(),
-                week_end=week_end.isoformat(),
-            )
-            print(f"[Reporting] Platform intelligence sent to {platform_email}")
+            try:
+                await send_platform_intelligence(
+                    to_email=platform_email,
+                    platform_narrative=platform_narrative,
+                    platform_metrics=platform_metrics,
+                    league_table=league_table,
+                    week_start=week_start.isoformat(),
+                    week_end=week_end.isoformat(),
+                )
+                print(f"[Reporting] Platform intelligence sent to {platform_email}")
+            except Exception as email_err:
+                print(f"[Reporting] Platform email failed: {email_err}")
         else:
             if not platform_email:
                 print("[Reporting] PLATFORM_REPORT_EMAIL not set — skipping platform email")
@@ -257,6 +263,7 @@ async def _call_claude_narrator(system_prompt: str, package: dict) -> dict:
     inventory = package.get("inventory", {})
     menu = package.get("menu", {})
     ops = package.get("ops", {})
+    consumption = package.get("consumption", {})
     anomalies = package.get("anomalies", [])
     benchmarks = package.get("benchmark_comparisons", {})
     prev = package.get("previous_week") or {}
@@ -276,8 +283,8 @@ REVENUE:
 FOOD COST:
 - Avg food cost %: {food_cost.get('food_cost_pct', 0):.1f}%
 - Trend: {food_cost.get('food_cost_trend', 'stable')}
-- Top margin killer: {food_cost.get('top_margin_killer_name', 'N/A')} ({food_cost.get('top_margin_killer_pct', 0):.1f}%)
-- Top star dish: {food_cost.get('top_star_dish_name', 'N/A')} ({food_cost.get('top_star_dish_pct', 0):.1f}%)
+- Top margin killer: {food_cost.get('top_margin_killer_name') or 'N/A'} ({food_cost.get('top_margin_killer_pct') or 0:.1f}%)
+- Top star dish: {food_cost.get('top_star_dish_name') or 'N/A'} ({food_cost.get('top_star_dish_pct') or 0:.1f}%)
 - Estimated margin loss: AED {food_cost.get('estimated_margin_loss', 0):,.2f}
 - Pricing agent recovery: AED {food_cost.get('pricing_agent_recovery', 0):,.2f}
 
@@ -285,8 +292,8 @@ INVENTORY:
 - Waste rate: {inventory.get('waste_rate_pct', 0):.1f}%
 - Waste qty: {inventory.get('waste_qty', 0):.1f} units ({inventory.get('waste_event_count', 0)} events)
 - Stock-outs: {inventory.get('stock_out_count', 0)} ingredients at zero
-- Avg days stock cover: {inventory.get('avg_days_stock_cover') or 'N/A'}
-- PO cycle time: {inventory.get('po_cycle_time_days') or 'N/A'} days
+- Avg days stock cover: {inventory.get('avg_days_stock_cover') if inventory.get('avg_days_stock_cover') is not None else 'N/A'}
+- PO cycle time: {inventory.get('po_cycle_time_days') if inventory.get('po_cycle_time_days') is not None else 'N/A'} days
 
 MENU:
 - Top dish: {menu.get('top_dish_name', 'N/A')} ({menu.get('top_dish_count', 0)} orders)
@@ -303,6 +310,9 @@ BENCHMARK COMPARISONS:
 - Waste rate: {inventory.get('waste_rate_pct', 0):.1f}% vs {benchmarks.get('waste_rate_pct', {}).get('benchmark', 5):.0f}% benchmark
 - Avg spend/cover: AED {revenue.get('avg_spend_per_cover', 0):.2f} vs AED {benchmarks.get('avg_spend_per_cover', {}).get('benchmark', 28):.0f} benchmark
 - Table turn: {ops.get('table_turn_rate', 0):.2f}x vs {benchmarks.get('table_turn_rate', {}).get('benchmark', 2.5):.1f}x benchmark
+
+CONSUMPTION ANALYSIS (Opening + Purchased = Production + Closing):
+{_format_consumption(consumption)}
 
 ANOMALIES DETECTED ({len(anomalies)}):
 {_format_anomalies(anomalies)}
@@ -385,6 +395,40 @@ Generate the platform intelligence briefing now."""
     except Exception as e:
         print(f"[Reporting] Claude platform call failed: {e}")
         return {}
+
+
+def _format_consumption(consumption: dict) -> str:
+    if not consumption:
+        return "  No consumption data."
+    summary = consumption.get("summary", {})
+    lines = [
+        f"  Overall verdict: {summary.get('overall_verdict', 'no_data')}",
+        f"  Recipe ingredients tracked: {summary.get('recipe_ingredient_count', 0)}",
+        f"  Unitary items tracked: {summary.get('unitary_item_count', 0)}",
+        f"  Over-purchased: {summary.get('ingredients_over_purchased', 0)} ingredient(s)",
+        f"  Discrepancies: {summary.get('ingredients_with_discrepancy', 0)} ingredient(s)",
+    ]
+    recipe_items = consumption.get("recipe_ingredients", [])
+    if recipe_items:
+        lines.append("  Recipe ingredient breakdown (Opening + Purchased = Production + Closing):")
+        for item in recipe_items[:10]:  # top 10 by variance
+            lines.append(
+                f"    {item['ingredient_name']} ({item['unit']}): "
+                f"opening={item['opening_stock']}, purchased={item['purchased']}, "
+                f"production={item['production_consumed']}, closing={item['closing_stock']}, "
+                f"expected_closing={item['expected_closing']}, variance={item['variance']:+.3f} → {item['verdict']}"
+            )
+    unitary = consumption.get("unitary_items", [])
+    if unitary:
+        lines.append("  Unitary items (Opening + Purchased = Sold + Closing):")
+        for item in unitary[:10]:
+            lines.append(
+                f"    {item['ingredient_name']} ({item['unit']}): "
+                f"opening={item['opening_stock']}, purchased={item['purchased']}, "
+                f"sold={item['sold']}, closing={item['closing_stock']}, "
+                f"expected_closing={item['expected_closing']}, variance={item['variance']:+.3f} → {item['verdict']}"
+            )
+    return "\n".join(lines)
 
 
 def _format_anomalies(anomalies: list) -> str:
