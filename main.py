@@ -40,6 +40,7 @@ from agents.seo_engine import run_seo_engine
 from agents.sales import run_apollo_pull, run_sales_batch
 from agents.marketing import run_marketing_content, run_marketing_publish
 from tools.email_sender import send_urgent_alert
+from tools.integrations.odoo_sync import run_odoo_sync
 
 # Global pool — created once at startup, reused by every job
 pool = None
@@ -492,6 +493,18 @@ def marketing_publish_job():
 
 
 # ---------------------------------------------------------------------------
+# Odoo sync job (nightly 01:00 — before food cost snapshot at 02:00)
+# ---------------------------------------------------------------------------
+
+def odoo_sync_job():
+    """Sync wrapper: pull Odoo data into Neon for all restaurant agents."""
+    try:
+        _run(run_odoo_sync(pool))
+    except Exception as e:
+        print(f"[Scheduler Error] odoo_sync_job crashed: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Graceful shutdown
 # ---------------------------------------------------------------------------
 
@@ -711,6 +724,16 @@ def main():
         name="Marketing — Publish Approved Blog Posts via Buffer",
         max_instances=1,
         misfire_grace_time=300,
+    )
+
+    # Odoo sync (nightly 01:00 — populates restaurants, ingredients, menu_items, orders, waste)
+    scheduler.add_job(
+        odoo_sync_job,
+        CronTrigger(hour=1, minute=0),
+        id="odoo_sync",
+        name="Odoo → Neon Sync",
+        max_instances=1,
+        misfire_grace_time=1800,
     )
 
     scheduler.start()
