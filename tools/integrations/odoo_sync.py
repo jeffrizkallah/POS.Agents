@@ -321,7 +321,8 @@ async def _upsert_orders(
         except ValueError:
             created_at = datetime.utcnow()
         status = "completed" if order.get("state") in ("done", "invoiced") else "cancelled"
-        order_rows.append((primary_restaurant_id, order.get("name") or f"ODOO-{order['id']}", status, created_at))
+        order_num = str(order.get("name") or "") or f"ODOO-{order.get('id', uuid.uuid4())}"
+        order_rows.append((primary_restaurant_id, order_num, status, created_at))
 
     # Batch insert orders
     await pool.executemany(
@@ -355,7 +356,8 @@ async def _upsert_orders(
             menu_item_id = menu_item_map.get(prod_id)
             if not menu_item_id:
                 continue
-            prod_name = line["product_id"][1] if isinstance(line["product_id"], list) and len(line["product_id"]) > 1 else str(prod_id)
+            raw_name = line["product_id"][1] if isinstance(line["product_id"], list) and len(line["product_id"]) > 1 else None
+            prod_name = str(raw_name) if raw_name else str(prod_id)
             qty = float(line.get("qty") or 0)
             price_unit = float(line.get("price_unit") or 0)
             item_rows.append((neon_order_id, menu_item_id, prod_name, qty, price_unit, qty * price_unit))
