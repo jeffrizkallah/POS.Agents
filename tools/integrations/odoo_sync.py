@@ -410,6 +410,433 @@ async def _upsert_waste(
 
 
 # ---------------------------------------------------------------------------
+# Extended sync: sale orders, purchase orders, manufacturing, recipes, transfers
+# ---------------------------------------------------------------------------
+
+_SINCE_2025 = "2025-01-01 00:00:00"
+_PAGE = 300  # orders per page (keep small for large line sets)
+
+
+def _sale_page(uid: int, offset: int):
+    """Blocking: fetch one page of sale orders + their lines."""
+    _, models = _odoo_proxies()
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "sale.order", "search_read",
+        [[["date_order", ">=", _SINCE_2025], ["state", "in", ["sale", "done"]]]],
+        {"fields": ["id", "name", "partner_id", "date_order", "state", "warehouse_id"],
+         "limit": _PAGE, "offset": offset},
+    )
+    if not orders:
+        return [], []
+    order_ids = [o["id"] for o in orders]
+    lines = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "sale.order.line", "search_read",
+        [[["order_id", "in", order_ids]]],
+        {"fields": ["id", "order_id", "product_id", "product_uom_qty",
+                    "product_uom", "price_unit", "price_subtotal"]},
+    )
+    return orders, lines
+
+
+async def _sync_sale_orders(pool: asyncpg.Pool, uid: int) -> None:
+    loop = asyncio.get_event_loop()
+    # Fresh start
+    await pool.execute("TRUNCATE sale_order_lines, sale_orders CASCADE")
+
+    offset, total_orders, total_lines = 0, 0, 0
+    while True:
+        orders, lines = await loop.run_in_executor(None, lambda o=offset: _sale_page(uid, o))
+        if not orders:
+            break
+
+        odoo_to_neon: dict[int, str] = {}
+        order_rows = []
+        for o in orders:
+            nid = _stable_id(f"odoo:sale.order:{o['id']}")
+            odoo_to_neon[o["id"]] = nid
+            client = (o["partner_id"][1] if isinstance(o.get("partner_id"), list) else "") or ""
+            branch = (o["warehouse_id"][1] if isinstance(o.get("warehouse_id"), list) else "") or ""
+            ds = o.get("date_order") or ""
+            od = None
+            if len(ds) >= 10:
+                try:
+                    od = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            order_rows.append((nid, str(o.get("name") or ""), branch, client, od, o.get("state") or ""))
+
+        await pool.executemany(
+            "INSERT INTO sale_orders (id, order_number, branch, client_name, order_date, state) "
+            "VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (id) DO NOTHING",
+            order_rows,
+        )
+
+        line_rows = []
+        for line in lines:
+            nid = _stable_id(f"odoo:sale.order.line:{line['id']}")
+            oid = line["order_id"][0] if isinstance(line.get("order_id"), list) else line.get("order_id")
+            soid = odoo_to_neon.get(oid)
+            if not soid:
+                continue
+            pname = (line["product_id"][1] if isinstance(line.get("product_id"), list) else "") or ""
+            unit  = (line["product_uom"][1] if isinstance(line.get("product_uom"), list) else "") or ""
+            qty   = float(line.get("product_uom_qty") or 0)
+            up    = float(line.get("price_unit") or 0)
+            sub   = float(line.get("price_subtotal") or 0)
+            # Get month from parent order
+            parent = next((o for o in orders if o["id"] == oid), None)
+            ds = parent.get("date_order") or "" if parent else ""
+            month = int(ds[5:7]) if len(ds) >= 7 else None
+            line_rows.append((nid, soid, pname, qty, unit, up, sub, up == 0.0, None, month))
+
+        for i in range(0, len(line_rows), 500):
+            await pool.executemany(
+                "INSERT INTO sale_order_lines "
+                "(id, sale_order_id, product_name, qty, unit, unit_price, price_subtotal, is_internal, barcode, month) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT (id) DO NOTHING",
+                line_rows[i:i + 500],
+            )
+
+        total_orders += len(orders)
+        total_lines  += len(line_rows)
+        offset       += len(orders)
+        print(f"[OdooSync] sale_orders: {total_orders} orders, {total_lines} lines so far...")
+        if len(orders) < _PAGE:
+            break
+
+    print(f"[OdooSync] sale_orders: done — {total_orders} orders, {total_lines} lines")
+
+
+def _purchase_page(uid: int, offset: int):
+    """Blocking: fetch one page of purchase orders + their lines."""
+    _, models = _odoo_proxies()
+    orders = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "purchase.order", "search_read",
+        [[["date_order", ">=", _SINCE_2025], ["state", "in", ["purchase", "done"]]]],
+        {"fields": ["id", "name", "partner_id", "date_order", "amount_total",
+                    "amount_tax", "picking_type_id"],
+         "limit": _PAGE, "offset": offset},
+    )
+    if not orders:
+        return [], []
+    order_ids = [o["id"] for o in orders]
+    lines = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "purchase.order.line", "search_read",
+        [[["order_id", "in", order_ids]]],
+        {"fields": ["id", "order_id", "product_id", "product_qty",
+                    "product_uom", "price_unit", "price_subtotal"]},
+    )
+    return orders, lines
+
+
+async def _sync_purchase_orders(pool: asyncpg.Pool, uid: int) -> None:
+    loop = asyncio.get_event_loop()
+    await pool.execute("TRUNCATE purchase_order_lines, purchase_orders CASCADE")
+
+    offset, total_orders, total_lines = 0, 0, 0
+    while True:
+        orders, lines = await loop.run_in_executor(None, lambda o=offset: _purchase_page(uid, o))
+        if not orders:
+            break
+
+        odoo_to_neon: dict[int, str] = {}
+        order_rows = []
+        for o in orders:
+            nid = _stable_id(f"odoo:purchase.order:{o['id']}")
+            odoo_to_neon[o["id"]] = nid
+            supplier = (o["partner_id"][1] if isinstance(o.get("partner_id"), list) else "") or ""
+            branch   = (o["picking_type_id"][1] if isinstance(o.get("picking_type_id"), list) else "") or ""
+            ds = o.get("date_order") or ""
+            od = None
+            if len(ds) >= 10:
+                try:
+                    od = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            month = int(ds[5:7]) if len(ds) >= 7 else None
+            total = min(float(o.get("amount_total") or 0), 9_999_999.0)
+            vat   = min(float(o.get("amount_tax") or 0), 9_999_999.0)
+            order_rows.append((nid, str(o.get("name") or ""), branch, supplier, od, total, vat, None, month))
+
+        await pool.executemany(
+            "INSERT INTO purchase_orders "
+            "(id, order_number, branch, supplier_name, order_date, total, vat, bill_number, month) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+            order_rows,
+        )
+
+        line_rows = []
+        for line in lines:
+            nid  = _stable_id(f"odoo:purchase.order.line:{line['id']}")
+            oid  = line["order_id"][0] if isinstance(line.get("order_id"), list) else line.get("order_id")
+            poid = odoo_to_neon.get(oid)
+            if not poid:
+                continue
+            pname = (line["product_id"][1] if isinstance(line.get("product_id"), list) else "") or ""
+            unit  = (line["product_uom"][1] if isinstance(line.get("product_uom"), list) else "") or ""
+            qty   = float(line.get("product_qty") or 0)
+            uc    = min(float(line.get("price_unit") or 0), 9_999_999.0)
+            sub   = min(float(line.get("price_subtotal") or 0), 9_999_999.0)
+            line_rows.append((nid, poid, pname, "", qty, unit, uc, sub, None))
+
+        for i in range(0, len(line_rows), 500):
+            await pool.executemany(
+                "INSERT INTO purchase_order_lines "
+                "(id, purchase_order_id, product_name, category, qty, unit, unit_cost, total, barcode) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+                line_rows[i:i + 500],
+            )
+
+        total_orders += len(orders)
+        total_lines  += len(line_rows)
+        offset       += len(orders)
+        print(f"[OdooSync] purchase_orders: {total_orders} orders, {total_lines} lines so far...")
+        if len(orders) < _PAGE:
+            break
+
+    print(f"[OdooSync] purchase_orders: done — {total_orders} orders, {total_lines} lines")
+
+
+def _fetch_manufacturing(uid: int, offset: int):
+    """Blocking: fetch one page of manufacturing orders."""
+    _, models = _odoo_proxies()
+    return models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "mrp.production", "search_read",
+        [[["date_planned_start", ">=", _SINCE_2025], ["state", "=", "done"]]],
+        {"fields": ["id", "name", "product_id", "product_uom_id", "product_qty",
+                    "date_planned_start", "state", "company_id"],
+         "limit": 1000, "offset": offset},
+    )
+
+
+async def _sync_manufacturing(pool: asyncpg.Pool, uid: int) -> None:
+    loop = asyncio.get_event_loop()
+    await pool.execute("TRUNCATE manufacturing_orders")
+
+    offset, total = 0, 0
+    while True:
+        records = await loop.run_in_executor(None, lambda o=offset: _fetch_manufacturing(uid, o))
+        if not records:
+            break
+
+        rows = []
+        for r in records:
+            nid     = _stable_id(f"odoo:mrp.production:{r['id']}")
+            pname   = (r["product_id"][1] if isinstance(r.get("product_id"), list) else "") or ""
+            unit    = (r["product_uom_id"][1] if isinstance(r.get("product_uom_id"), list) else "") or ""
+            company = (r["company_id"][1] if isinstance(r.get("company_id"), list) else "") or ""
+            ds      = r.get("date_planned_start") or ""
+            sd = None
+            if len(ds) >= 10:
+                try:
+                    sd = datetime.strptime(ds[:10], "%Y-%m-%d").date()
+                except ValueError:
+                    pass
+            qty = min(float(r.get("product_qty") or 0), 9_999_999.0)
+            rows.append((nid, str(r.get("name") or ""), pname, unit, qty, sd, r.get("state") or "", company, None))
+
+        for i in range(0, len(rows), 500):
+            await pool.executemany(
+                "INSERT INTO manufacturing_orders "
+                "(id, reference, product_name, unit, qty_to_produce, scheduled_date, state, company, barcode) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) ON CONFLICT (id) DO NOTHING",
+                rows[i:i + 500],
+            )
+        total  += len(records)
+        offset += len(records)
+        if len(records) < 1000:
+            break
+
+    print(f"[OdooSync] manufacturing_orders: {total} records")
+
+
+def _fetch_boms(uid: int):
+    """Blocking: fetch all BOMs and all BOM lines."""
+    _, models = _odoo_proxies()
+    boms = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "mrp.bom", "search_read",
+        [[["active", "=", True]]],
+        {"fields": ["id", "product_id", "product_tmpl_id", "product_qty",
+                    "product_uom_id", "bom_line_ids"], "limit": 5000},
+    )
+    # Fetch all BOM lines at once
+    lines = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "mrp.bom.line", "search_read",
+        [[]],
+        {"fields": ["id", "bom_id", "product_id", "product_qty",
+                    "product_uom_id", "child_bom_id"], "limit": 50000},
+    )
+    # Fetch product standard prices for cost calculation
+    product_ids = list({
+        (line["product_id"][0] if isinstance(line.get("product_id"), list) else line.get("product_id"))
+        for line in lines if line.get("product_id")
+    })
+    costs: dict[int, float] = {}
+    for i in range(0, len(product_ids), 500):
+        chunk = product_ids[i:i+500]
+        prods = models.execute_kw(
+            ODOO_DB, uid, ODOO_API_KEY, "product.product", "search_read",
+            [[["id", "in", chunk]]],
+            {"fields": ["id", "standard_price"]},
+        )
+        for p in prods:
+            costs[p["id"]] = float(p.get("standard_price") or 0)
+    return boms, lines, costs
+
+
+async def _sync_recipes(pool: asyncpg.Pool, uid: int) -> None:
+    loop = asyncio.get_event_loop()
+    await pool.execute("TRUNCATE recipes")
+
+    boms, lines, costs = await loop.run_in_executor(None, lambda: _fetch_boms(uid))
+
+    # Build maps
+    bom_by_id: dict[int, dict] = {b["id"]: b for b in boms}
+    # product_id → bom (for sub-recipe detection)
+    product_to_bom: dict[int, int] = {}
+    for b in boms:
+        pid = b["product_id"][0] if isinstance(b.get("product_id"), list) else b.get("product_id")
+        if pid:
+            product_to_bom[pid] = b["id"]
+
+    # Lines by bom_id
+    lines_by_bom: dict[int, list] = {}
+    for line in lines:
+        bid = line["bom_id"][0] if isinstance(line.get("bom_id"), list) else line.get("bom_id")
+        if bid:
+            lines_by_bom.setdefault(bid, []).append(line)
+
+    # Compute recipe total cost per bom_id (sum of ingredient_total_cost)
+    def bom_total_cost(bom_id: int) -> float:
+        total = 0.0
+        for line in lines_by_bom.get(bom_id, []):
+            pid = line["product_id"][0] if isinstance(line.get("product_id"), list) else line.get("product_id")
+            qty = float(line.get("product_qty") or 0)
+            uc  = costs.get(pid, 0.0) if pid else 0.0
+            total += qty * uc
+        return total
+
+    rows = []
+    for bom in boms:
+        bid       = bom["id"]
+        fpid      = bom["product_id"][0] if isinstance(bom.get("product_id"), list) else bom.get("product_id")
+        fpname    = (bom["product_id"][1] if isinstance(bom.get("product_id"), list) else "") or ""
+        recipe_cost = bom_total_cost(bid)
+
+        for line in lines_by_bom.get(bid, []):
+            pid   = line["product_id"][0] if isinstance(line.get("product_id"), list) else line.get("product_id")
+            cname = (line["product_id"][1] if isinstance(line.get("product_id"), list) else "") or ""
+            unit  = (line["product_uom_id"][1] if isinstance(line.get("product_uom_id"), list) else "") or ""
+            qty   = float(line.get("product_qty") or 0)
+            uc    = costs.get(pid, 0.0) if pid else 0.0
+            itc   = qty * uc
+            # Detect sub-recipe
+            child_bom_id = None
+            if isinstance(line.get("child_bom_id"), list):
+                child_bom_id = line["child_bom_id"][0] if line["child_bom_id"] else None
+            elif isinstance(line.get("child_bom_id"), int):
+                child_bom_id = line["child_bom_id"]
+            is_sub = child_bom_id is not None or (pid in product_to_bom)
+
+            row_key = f"odoo:bom.line:{line['id']}:{bid}"
+            nid = _stable_id(row_key)
+            rows.append((
+                nid, bid, fpname, None,
+                cname, None,
+                qty, unit,
+                min(uc, 9_999_999.0),
+                min(itc, 9_999_999.0),
+                min(recipe_cost, 9_999_999.0),
+                is_sub, child_bom_id,
+            ))
+
+    for i in range(0, len(rows), 500):
+        await pool.executemany(
+            "INSERT INTO recipes "
+            "(id, bom_odoo_id, finished_product, finished_product_barcode, "
+            " component_name, component_barcode, qty, unit, unit_cost, "
+            " ingredient_total_cost, recipe_total_cost, is_subrecipe, child_bom_id) "
+            "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (id) DO NOTHING",
+            rows[i:i + 500],
+        )
+
+    print(f"[OdooSync] recipes: {len(boms)} BOMs, {len(rows)} component rows")
+
+
+def _transfer_page(uid: int, offset: int):
+    """Blocking: fetch one page of done internal transfers + their moves."""
+    _, models = _odoo_proxies()
+    pickings = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "stock.picking", "search_read",
+        [[["date_done", ">=", _SINCE_2025],
+          ["state", "=", "done"],
+          ["picking_type_code", "=", "internal"]]],
+        {"fields": ["id", "name", "location_id", "location_dest_id",
+                    "date_done", "scheduled_date"],
+         "limit": _PAGE, "offset": offset},
+    )
+    if not pickings:
+        return [], []
+    picking_ids = [p["id"] for p in pickings]
+    moves = models.execute_kw(
+        ODOO_DB, uid, ODOO_API_KEY, "stock.move", "search_read",
+        [[["picking_id", "in", picking_ids], ["state", "=", "done"]]],
+        {"fields": ["id", "picking_id", "product_id", "quantity_done",
+                    "product_uom", "price_unit"]},
+    )
+    return pickings, moves
+
+
+async def _sync_transfers(pool: asyncpg.Pool, uid: int) -> None:
+    loop = asyncio.get_event_loop()
+    await pool.execute("TRUNCATE transfers")
+
+    offset, total = 0, 0
+    while True:
+        pickings, moves = await loop.run_in_executor(None, lambda o=offset: _transfer_page(uid, o))
+        if not pickings:
+            break
+
+        pick_map: dict[int, dict] = {p["id"]: p for p in pickings}
+        rows = []
+        for move in moves:
+            nid   = _stable_id(f"odoo:stock.move:{move['id']}")
+            pid   = move["picking_id"][0] if isinstance(move.get("picking_id"), list) else move.get("picking_id")
+            pick  = pick_map.get(pid)
+            if not pick:
+                continue
+            from_b = (pick["location_id"][1] if isinstance(pick.get("location_id"), list) else "") or ""
+            to_b   = (pick["location_dest_id"][1] if isinstance(pick.get("location_dest_id"), list) else "") or ""
+            pname  = (move["product_id"][1] if isinstance(move.get("product_id"), list) else "") or ""
+            unit   = (move["product_uom"][1] if isinstance(move.get("product_uom"), list) else "") or ""
+            qty    = float(move.get("quantity_done") or 0)
+            cost   = min(float(move.get("price_unit") or 0), 9_999_999.0)
+            ref    = str(pick.get("name") or "")
+            ds_eff = pick.get("date_done") or ""
+            ds_sch = pick.get("scheduled_date") or ""
+            eff_d  = datetime.strptime(ds_eff[:10], "%Y-%m-%d").date() if len(ds_eff) >= 10 else None
+            sch_d  = datetime.strptime(ds_sch[:10], "%Y-%m-%d").date() if len(ds_sch) >= 10 else None
+            rows.append((nid, ref, from_b, to_b, eff_d, sch_d, pname, None, qty, unit, cost, None))
+
+        for i in range(0, len(rows), 500):
+            await pool.executemany(
+                "INSERT INTO transfers "
+                "(id, reference, from_branch, to_branch, effective_date, scheduled_date, "
+                " product_name, category, qty, unit, cost, barcode) "
+                "VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT (id) DO NOTHING",
+                rows[i:i + 500],
+            )
+
+        total  += len(rows)
+        offset += len(pickings)
+        print(f"[OdooSync] transfers: {total} moves so far...")
+        if len(pickings) < _PAGE:
+            break
+
+    print(f"[OdooSync] transfers: done — {total} stock moves")
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -457,6 +884,11 @@ async def run_odoo_sync(pool: asyncpg.Pool) -> None:
         menu_item_map  = await _upsert_menu_items(pool, data["pos_products"], restaurant_map)
         await _upsert_orders(pool, data["pos_orders"], data["pos_lines"], menu_item_map, restaurant_map)
         await _upsert_waste(pool, data["scraps"], ingredient_map, restaurant_map)
+        await _sync_sale_orders(pool, uid)
+        await _sync_purchase_orders(pool, uid)
+        await _sync_manufacturing(pool, uid)
+        await _sync_recipes(pool, uid)
+        await _sync_transfers(pool, uid)
     except Exception as e:
         print(f"[OdooSync] Neon upsert failed: {e}")
         return
